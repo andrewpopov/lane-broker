@@ -85,6 +85,11 @@ export const start = (client, claimed) => call(client, 'ld_start', claimed.id, c
 export const heartbeat = (client, claimed) => call(client, 'ld_heartbeat', claimed.id, claimed.epoch, claimed.token);
 export const release = (client, claimed, proof = 'never-started') => call(client, 'ld_release', claimed.id, claimed.epoch, claimed.token, proof);
 
+/** Real-client tickets carry no header.repoName until S3, so they are adhoc; a runner that must claim them is put in open mode (a superuser write, which the guard trigger passes), leaving a1 restricted everywhere else. */
+export async function openRepoMode(world, login) {
+  await (await world.su()).query("UPDATE lane_dispatch.principals SET repo_mode = 'open' WHERE login_role = $1", [login]);
+}
+
 /** A requeue backs the ticket off (5 s and up); a test that claims it again straight away lifts the backoff first. */
 export async function liftBackoff(world) {
   await (await world.su()).query("UPDATE lane_dispatch.tickets SET not_before = '-infinity'");
@@ -136,7 +141,7 @@ export async function downgradeToV11(world) {
   await su.query('DROP TRIGGER principals_repo_guard ON lane_dispatch.principals');
   await su.query('DROP FUNCTION lane_dispatch.principals_repo_guard(), lane_dispatch.ticket_repo(jsonb), lane_dispatch.eligible(text[], text, text[], text[], text), lane_dispatch.scarcity(text[], text)');
   await su.query('DROP FUNCTION lane_dispatch.ld_placeable(text, text[], text), lane_dispatch.ld_set_principal(text, text, text, text[], text[], int, text), lane_dispatch.ld_set_repo_mode(text, text)');
-  await su.query('DROP INDEX lane_dispatch.tickets_quarantined, lane_dispatch.tickets_terminal_recent');
+  await su.query('DROP INDEX lane_dispatch.tickets_terminal_recent');
   await su.query('ALTER TABLE lane_dispatch.principals DROP COLUMN repo_mode');
   await su.query('DELETE FROM lane.schema_version WHERE version = 12');
   await su.query(fs.readFileSync(new URL('./fixtures/lane-v11-functions.sql', import.meta.url), 'utf8'));

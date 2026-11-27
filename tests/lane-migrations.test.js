@@ -148,8 +148,8 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
 
     await c.query("SELECT lane_dispatch.ld_set_principal('lane_mig_new', 'agent', 'mig3', '{}', '{}', 1)");
     assert.equal((await c.query("SELECT repo_mode FROM lane_dispatch.principals WHERE login_role = 'lane_mig_new'")).rows[0].repo_mode, 'enforce', 'a principal that did not exist at the upgrade starts default-deny');
-    const { rows: indexes } = await c.query("SELECT indexname FROM pg_indexes WHERE schemaname = 'lane_dispatch' AND indexname IN ('tickets_quarantined', 'tickets_terminal_recent') ORDER BY 1");
-    assert.deepEqual(indexes.map((r) => r.indexname), ['tickets_quarantined', 'tickets_terminal_recent']);
+    const { rows: indexes } = await c.query("SELECT indexname FROM pg_indexes WHERE schemaname = 'lane_dispatch' AND indexname = 'tickets_terminal_recent'");
+    assert.deepEqual(indexes.map((r) => r.indexname), ['tickets_terminal_recent']);
   });
 
   test('a migration that fails rolls back whole: no partial change, no version row, and the error propagates', async () => {

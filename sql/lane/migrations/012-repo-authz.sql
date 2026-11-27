@@ -5,6 +5,5 @@ ALTER TABLE lane_dispatch.principals
   ADD COLUMN repo_mode text NOT NULL DEFAULT 'enforce' CHECK (repo_mode IN ('open','audit','enforce'));
 UPDATE lane_dispatch.principals SET repo_mode = 'open' WHERE kind = 'agent';
 
--- The audit view reads these states every minute: queued and held have indexes already (005), the other two states it reads get partial ones.
-CREATE INDEX tickets_quarantined ON lane_dispatch.tickets (status_changed_at) WHERE state = 'quarantined';
+-- The audit view reads the recently finished tickets every minute: queued and held have indexes already (005), the terminal states get a partial one. 006 removed the quarantined state.
 CREATE INDEX tickets_terminal_recent ON lane_dispatch.tickets (finished_at) WHERE state IN ('finished','cancelled','withdrawn','lost');

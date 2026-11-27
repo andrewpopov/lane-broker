@@ -168,7 +168,7 @@ const SEMANTICS = {
     const su = await w.su();
     const { rows: [{ ttl }] } = await su.query('SELECT extract(epoch FROM lease_until - now()) AS ttl FROM lane_dispatch.tickets');
     assert.ok(ttl > 110 && ttl <= 120, `lease ${ttl}`);
-    assert.deepEqual([got.snapshot, got.header, got.binding], [{ key: 'snap', sha256: 'x' }, { cmd: ['true'] }, { protocol: 1 }]);
+    assert.deepEqual([got.snapshot, got.header, got.binding], [{ key: 'snap', sha256: 'x' }, { cmd: ['true'], repoName: 'repoA' }, { protocol: 1 }]);
   },
 
   'a claim takes the highest priority, then the oldest, and only what fits the runner free cpu, memory and held keys': async (w) => {

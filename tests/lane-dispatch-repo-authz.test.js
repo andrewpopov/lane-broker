@@ -172,7 +172,7 @@ const GUARDS = {
     await hold(4, 'claimed', 'a1');
     await hold(5, 'running', 'x');
     await hold(6, 'running', 'gone');
-    await su.query("UPDATE lane_dispatch.tickets SET state = 'quarantined' WHERE id = $1", [tid(7)]);
+    await su.query("UPDATE lane_dispatch.tickets SET state = 'lost', finished_at = now() WHERE id = $1", [tid(7)]);
     await su.query("UPDATE lane_dispatch.tickets SET state = 'finished', finished_at = now(), host = 'a1' WHERE id = $1", [tid(8)]);
     await su.query("UPDATE lane_dispatch.tickets SET state = 'finished', finished_at = now() - interval '1 hour', host = 'a1' WHERE id = $1", [tid(9)]);
     await su.query("UPDATE lane_dispatch.tickets SET state = 'withdrawn', finished_at = now() WHERE id = $1", [tid(10)]);
@@ -184,7 +184,7 @@ const GUARDS = {
       row('adhoc', false, S1, null, 'queued', null, false, false, false),
       row('repoA', true, S1, null, 'claimed', 'a1', true, true, false),
       row('repoA', true, S1, null, 'finished', 'a1', true, true, false),
-      row('repoA', true, S1, null, 'quarantined', null, true, true, false),
+      row('repoA', true, S1, null, 'lost', null, true, true, false),
       row('repoA', true, S1, '0.119.0', 'queued', null, true, true, false),
       row('repoA', true, S1, null, 'running', 'gone', true, true, true),
       row('repoA', true, S1, null, 'withdrawn', null, true, true, false),
@@ -223,15 +223,14 @@ const GUARDS = {
     await insert('finished', 20000, new Date(Date.now() - 3600e3));
     await insert('queued', 30, null);
     await insert('claimed', 10, null);
-    await insert('quarantined', 5, null);
     await insert('finished', 5, new Date());
     await su.query('ANALYZE lane_dispatch.tickets');
     const { rows } = await reader.query('SELECT state, sum(n)::int AS n FROM lane.pull_repo_audit GROUP BY state ORDER BY state');
-    assert.deepEqual(rows, [{ state: 'claimed', n: 10 }, { state: 'finished', n: 5 }, { state: 'quarantined', n: 5 }, { state: 'queued', n: 30 }]);
+    assert.deepEqual(rows, [{ state: 'claimed', n: 10 }, { state: 'finished', n: 5 }, { state: 'queued', n: 30 }]);
     const { rows: plan } = await reader.query('EXPLAIN (COSTS OFF) SELECT * FROM lane.pull_repo_audit');
     const text = plan.map((r) => r['QUERY PLAN']).join('\n');
     assert.doesNotMatch(text, /Seq Scan on tickets/, text);
-    for (const index of ['tickets_queued', 'tickets_held|tickets_lease', 'tickets_quarantined', 'tickets_terminal_recent']) assert.match(text, new RegExp(`(${index})\\b`), `${index} is used\n${text}`);
+    for (const index of ['tickets_queued', 'tickets_held|tickets_lease', 'tickets_terminal_recent']) assert.match(text, new RegExp(`(${index})\\b`), `${index} is used\n${text}`);
   },
 };
 

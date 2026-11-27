@@ -1405,7 +1405,7 @@ BEGIN
     CREATE OR REPLACE VIEW lane.pull_runners AS
       SELECT host, last_seen FROM lane_dispatch.runners;
   END IF;
-  -- BRAIN-1116: pull_repo_audit is bounded to the states the collector reads once a minute (queued, held, quarantined, finished in the last 15 minutes),
+  -- BRAIN-1116: pull_repo_audit is bounded to the states the collector reads once a minute (queued, held, finished in the last 15 minutes),
   -- one branch per partial index, with coverage worked out once per distinct (repo, requires_tags) rather than per ticket. The submit login is a role name, not a secret.
   IF v_repo_mode THEN
     CREATE OR REPLACE VIEW lane.pull_repo_audit AS
@@ -1413,8 +1413,6 @@ BEGIN
         SELECT t.owner, t.state, t.host, t.requires_tags, t.header FROM lane_dispatch.tickets t WHERE t.state = 'queued'
         UNION ALL
         SELECT t.owner, t.state, t.host, t.requires_tags, t.header FROM lane_dispatch.tickets t WHERE t.state IN ('claimed','running')
-        UNION ALL
-        SELECT t.owner, t.state, t.host, t.requires_tags, t.header FROM lane_dispatch.tickets t WHERE t.state = 'quarantined'
         UNION ALL
         SELECT t.owner, t.state, t.host, t.requires_tags, t.header FROM lane_dispatch.tickets t
          WHERE t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at > now() - interval '15 minutes'

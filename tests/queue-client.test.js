@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { createQueueClient, QueueError } from '../src/queue-client.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, claim, start, tid, downgradeToV6, downgradeToV8 } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, claim, start, openRepoMode, tid, downgradeToV6, downgradeToV8 } from './lane-dispatch-fixture.js';
 import { CA_TEXT, QUEUE_URL, harnessClient, secretFiles } from './helpers/queue-fixture.js';
 
 /** BRAIN-1036 R4: the submitter queue client against a disposable Postgres. */
@@ -73,6 +73,7 @@ const SCENARIOS = {
     assert.deepEqual((await queue.listMine()).map((row) => row.id), [tid(1)]);
     assert.deepEqual(await queue.listMine({ states: ['running'] }), []);
 
+    await openRepoMode(w, logins.a1);
     const claimed = await claim(a1);
     assert.equal(claimed.id, tid(1));
     await start(a1, claimed);
@@ -83,9 +84,9 @@ const SCENARIOS = {
     assert.equal(await queue.withdraw(tid(3)), 'withdrawn');
     assert.equal(await queue.withdraw(tid(3)), 'withdrawn');
     assert.equal(await queue.withdraw(tid(404)), 'missing');
-    assert.equal(await queue.placeable('repoA', []), 3);
+    assert.equal(await queue.placeable('repoA', []), 3, 'the client sends no repo name yet, so the probe scores adhoc, which the open a1, a2 and x all take');
     assert.equal(await queue.placeable('repoA', ['fast']), 1);
-    assert.equal(await queue.placeable('nowhere', ['fast']), 0);
+    assert.equal(await queue.placeable('repoA', ['gpu']), 0);
   },
 
   'enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1': async (w, t, createClient) => {
