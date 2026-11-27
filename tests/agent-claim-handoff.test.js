@@ -210,7 +210,7 @@ const scenarios = {
     const hot = { pressureLevel: 2 };
     const cool = { pressureLevel: 0 };
     try {
-      await rw.agent({ load, deviceSampler: sampler, config: { deviceGates: gates(3) } });
+      await rw.agent({ load, deviceSampler: sampler, config: { deviceGates: gates(3) }, textfileDir: makeTmpDir('gates-prom-') });
       await feed(hot);
       await happens('closed', () => gate()?.closed === true);
       await feed(cool);

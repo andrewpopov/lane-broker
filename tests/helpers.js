@@ -71,10 +71,7 @@ export function writeGlobalConfig(home, cfg) {
   // scheduler dimension. Keep those fixtures independent of ambient host load;
   // active-admission tests opt in explicitly. cpuLimit 'off': no systemd-run scope racing nice checks.
   const deterministicCfg = { schedulerMode: 'shadow', cpuLimit: 'off', ...cfg };
-  // Renamed into place: a live agent re-reads this file on every poll and must never see it truncated.
-  const target = path.join(home, 'config.json');
-  fs.writeFileSync(`${target}.tmp`, JSON.stringify(deterministicCfg, null, 2));
-  fs.renameSync(`${target}.tmp`, target);
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(deterministicCfg, null, 2));
 }
 
 export function writeRepoConfig(dir, cfg) {

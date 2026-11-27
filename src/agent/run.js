@@ -1,6 +1,5 @@
 import { openAgentCore } from './agent.js';
 import { AgentConfigError } from './config.js';
-import { loadGlobalConfig } from '../config.js';
 import { brokerConfigReader, claimBlock, claimFigures, claimOnce, drainOwners, drainsOf, isDraining, presentTools } from './claims.js';
 import { ExecutionDriver } from './execution.js';
 import { createS3Client } from '../s3-client.js';
@@ -63,7 +62,6 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   let deviceSampledAt = -Infinity;
   let deviceSampleError = null;
   let deviceGatesConfig = config.deviceGates;
-  let deviceConfigError = null;
   let metricsWrittenAt = -Infinity;
   const writeMetrics = (tickAt) => {
     if (!textfileDir || tickAt - metricsWrittenAt < config.pollMs) return;
@@ -76,15 +74,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   };
   const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, owners: () => drainOwners(config.stateDir), deviceGates });
 
-  const reloadDeviceGatesConfig = () => {
-    try {
-      deviceGatesConfig = loadGlobalConfig({ home: config.brokerHome }).deviceGates ?? null;
-      deviceConfigError = null;
-    } catch (err) {
-      if (err.message !== deviceConfigError) log(`device gates: broker config unreadable, keeping the last good thresholds: ${err.message}`);
-      deviceConfigError = err.message;
-    }
-  };
+  const reloadDeviceGatesConfig = () => { deviceGatesConfig = readBrokerConfig().deviceGates ?? null; };
 
   async function refreshDeviceGates() {
     if (now() - deviceSampledAt < config.pollMs) return;
