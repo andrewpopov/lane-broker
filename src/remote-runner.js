@@ -799,7 +799,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   } else if (structured && structured.provenanceOnly !== true) {
     exit = structured.exit;
     signal = structured.signal;
-    settlement = relayedSettlement(structured);
+    settlement = relayedSettlement({ ...structured, kind: cancelled ? 'cancelled' : 'completed' });
     reason = settlement.reason ?? null;
     observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
     observedRssPeakBytes = sanitizeRssPeak(structured.observedRssPeakBytes);

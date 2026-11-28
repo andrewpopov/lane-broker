@@ -32,13 +32,13 @@ const RECORDS = {
   deadline_exceeded: { exit: 124, reason: 'deadline_exceeded', deadlineMs: 60_000, deadline: { ms: 60_000, source: 'lane', mode: 'enforce' }, stopProven: false },
 };
 
-async function adoptedResult(load, record) {
+async function adoptedResult(load, record, expected = { settled: true, state: 'adopted', exit: 124 }) {
   const ctx = setup();
   const globalCfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
   const id = seedAdoptable(ctx, record);
   const { reconcileRemoteAttempt: reconcile } = await load('remote-reconcile.js');
   const outcome = await reconcile(ctx.state, id, { globalCfg, env: ctx.env, sshBin: 'ssh', deadlineMs: 20_000 });
-  assert.deepEqual(outcome, { settled: true, state: 'adopted', exit: 124 });
+  if (expected !== null) assert.deepEqual(outcome, expected);
   const shown = await laneRun(['result', id, '--json'], { env: ctx.env });
   return JSON.parse(shown.stdout);
 }
@@ -59,6 +59,18 @@ for (const [name, record] of Object.entries(RECORDS)) {
 test('push adoption: an ordinary exit 124 carries no reason', async () => {
   const result = await adoptedResult(realLoad, { exit: 124, reason: null });
   assert.equal(result.reason ?? null, null);
+});
+
+const CANCELLED_AFTER_KILL = { kind: 'cancelled', exit: 130, reason: 'no-progress', noProgressTimeoutMs: 2000, stopProven: true };
+
+test('push adoption: a cancelled record that kept a watchdog reason adopts as a cancel without the kill metadata', async () => {
+  const result = await adoptedResult(realLoad, CANCELLED_AFTER_KILL, null);
+  assert.equal(result.exit, 130);
+  for (const field of ['reason', 'noProgressTimeoutMs', 'stopProven']) assert.equal(result[field] ?? null, null, field);
+});
+
+test('canary: with the completed-only rule removed, a cancel adopted after a watchdog kill keeps the kill reason', async () => {
+  await assertCanaryFails('reasons.js', ["record.kind !== 'completed' || ", ''], (load) => adoptedResult(load, CANCELLED_AFTER_KILL, null).then((r) => assert.equal(r.reason ?? null, null)));
 });
 
 test('canary: with relayedSettlement removed from push adoption, a run-limit record reads as a bare exit 124', async () => {

@@ -15,11 +15,11 @@ export const SETTLEMENT_REASONS = Object.freeze(Object.keys(WINDOW_FIELD));
 
 /**
  * The settlement fields every relay of a command's terminal record forwards, so a kill's reason survives each hop instead of reading as a bare exit.
- * A reason is relayed only with its finite window; `deadlineMs`, `deadline`, `guard` and `stopProven` ride with it. Empty for any other record.
+ * Only a completed record relays: a cancel recorded before publication wins, so its result never keeps a kill reason. A reason is relayed only with its finite window; `deadlineMs`, `deadline`, `guard` and `stopProven` ride with it. Empty for any other record.
  */
 export function relayedSettlement(record) {
   const windowField = WINDOW_FIELD[record?.reason];
-  if (windowField === undefined || !Number.isFinite(record[windowField])) return {};
+  if (record.kind !== 'completed' || windowField === undefined || !Number.isFinite(record[windowField])) return {};
   return {
     reason: record.reason,
     [windowField]: record[windowField],

@@ -1617,7 +1617,7 @@ const KILLS = {
   deadline_exceeded: { exit: 124, reason: 'deadline_exceeded', deadlineMs: 60_000, deadline: { ms: 60_000, source: 'lane', mode: 'enforce' }, stopProven: false },
 };
 
-async function publishedKill(record) {
+async function publishedKill(record, { cancel = false } = {}) {
   const gate = makeTmpDir('kill-hold-');
   const hold = { LANE_BROKER_TEST_HOLD_AT: 'remote-exec-before-result', LANE_BROKER_TEST_HOLD_READY: path.join(gate, 'ready'), LANE_BROKER_TEST_HOLD_GO: path.join(gate, 'go') };
   const ctx = setupRunner();
@@ -1628,6 +1628,7 @@ async function publishedKill(record) {
   const laneId = fs.readFileSync(ticketPath(ctx, h.ticketId, 'remote-id'), 'utf8').trim();
   const resultFile = path.join(paths(ctx.state).results, `${laneId}.json`);
   fs.writeFileSync(resultFile, JSON.stringify({ ...readJsonSafe(resultFile), ...record }));
+  if (cancel) fs.writeFileSync(ticketPath(ctx, h.ticketId, 'cancelled'), '');
   fs.writeFileSync(hold.LANE_BROKER_TEST_HOLD_GO, 'go');
   assert.equal((await closed).code, 0);
   return readExecResult(ctx, h.ticketId);
@@ -1648,4 +1649,12 @@ for (const [name, record] of Object.entries(KILLS)) {
 test('buildResult carries the settlement fields it is handed', () => {
   const result = buildResult(makeHeader(), tmpDir('settlement-wire'), { kind: 'completed', exit: 124, reason: 'run-limit', settlement: { reason: 'run-limit', runLimitMs: 5, guard: 'run-limit' } });
   assert.deepEqual([result.reason, result.runLimitMs, result.guard], ['run-limit', 5, 'run-limit']);
+});
+
+test('a cancel recorded after a watchdog or deadline kill wins: the published result is cancelled and keeps no kill reason', async () => {
+  for (const [name, record] of Object.entries(KILLS)) {
+    const result = await publishedKill(record, { cancel: true });
+    assert.equal(result.kind, 'cancelled', name);
+    for (const field of ['reason', 'runLimitMs', 'deadlineMs', 'deadline', 'guard']) assert.equal(result[field] ?? null, null, `${name}: ${field}`);
+  }
 });
