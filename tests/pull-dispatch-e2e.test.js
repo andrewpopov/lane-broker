@@ -10,7 +10,7 @@ import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World } from './lane-dispatch-fixture.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pullE2E } from './helpers/pull-e2e.js';
-import { scaledMs } from './helpers.js';
+import { gitFixture, scaledMs } from './helpers.js';
 
 /**
  * BRAIN-1036 R7: the placement hook and the settle mapping, through the shipped caller path. `lane run` spawns a real supervisor
@@ -18,6 +18,7 @@ import { scaledMs } from './helpers.js';
  * the exit code are all production code; a stub runner plays the S2 agent.
  */
 
+const PACKAGE_VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(fn, timeoutMs = 60_000, detail = () => '') {
   for (const deadline = Date.now() + scaledMs(timeoutMs); !(await fn()); await sleep(100)) if (Date.now() > deadline) assert.fail(`timed out waiting for the ticket state ${detail()}`);
@@ -249,6 +250,17 @@ const SCENARIOS = {
     await medium;
   },
 
+  'a pull ticket carries the canonical repo name of the checkout\'s origin and the submitter\'s broker version in its header': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true });
+    gitFixture(['remote', 'add', 'origin', 'git@github-personal:PopovLabs/TowerPower.git'], fx.repoDir);
+    const running = fx.run();
+    const id = await fx.enqueued();
+    const { header } = await fx.ticket(id);
+    assert.deepEqual([header.repoName, header.brokerVersion], ['popovlabs/towerpower', PACKAGE_VERSION]);
+    await fx.run1();
+    await running;
+  },
+
   'a second supervisor reuses the readiness verdict the first stored: no lifecycle read, no queue login': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, globalExtra: DISPATCH_ONLY });
     await (await w.su()).query("UPDATE lane_dispatch.principals SET max_claims = 0 WHERE kind = 'agent'");
@@ -320,7 +332,10 @@ const RECOVERED_SWEEP = 'a ticket whose supervisor died after the enqueue settle
 const RECOVERED_WAIT = 'a ticket whose supervisor died after the enqueue settles through lane wait exactly as the live path publishes it: one history row, the same result fields, the tail in the custom log';
 const NOT_PREPARED = 'a snapshot upload that fails permanently before anything is enqueued is the never-started path: nothing is queued, a dispatch-only host exits 76, another runs it locally';
 
+const STAMPED_HEADER = 'a pull ticket carries the canonical repo name of the checkout\'s origin and the submitter\'s broker version in its header';
 const CANARIES = [
+  [STAMPED_HEADER, 'run.js', ['      repoName: submitRepoName,\n      weight', "      repoName: 'adhoc',\n      weight"]],
+  [STAMPED_HEADER, 'repo-name.js', ['brokerVersion: BROKER_VERSION }', '}']],
   ['after a cancel the supervisor keeps polling at its own pace: a held ticket whose runner has not yet answered is not stepped in a busy loop', ...pullTicket('  const timer = setTimeout(done, ms);\n  signal?.addEventListener', '  if (signal?.aborted) return resolve();\n  const timer = setTimeout(done, ms);\n  signal?.addEventListener')],
   [RECOVERED_SWEEP, 'pull-services.js', ['    ...publicationBindingsFor(root, id),\n', '']],
   [RECOVERED_WAIT, 'pull-services.js', ['    ...publicationBindingsFor(root, id),\n', '']],

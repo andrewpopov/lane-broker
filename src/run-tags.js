@@ -34,12 +34,12 @@ export function noOnlineRunnerMessage(detail, tags) {
  * A queue without `ld_placeable_detail` (migration 012 not applied) is asked `ld_placeable` instead, which still catches "no runner has the tag".
  * Best effort beyond that: pull not configured or a queue that cannot be reached never blocks the run.
  */
-export async function checkRunnable({ cfg, root, repoKey, tags, servicesFor = pullServices }) {
+export async function checkRunnable({ cfg, root, repoKey, repoName, tags, servicesFor = pullServices }) {
   if (!pullConfigured(cfg)) return isPinnedToHost(tags) ? { ok: false, message: `no runner can claim [${tags.join(', ')}]: this host does not use pull dispatch, and a run pinned to a runner never runs here` } : { ok: true };
   try {
     const services = servicesFor(cfg, root);
     if (!services.available) return { ok: true };
-    const detail = await services.queue.placeableDetail(repoKey, tags, QUEUE_PROBE).catch(async () => ({ eligible: await services.queue.placeable(repoKey, tags, QUEUE_PROBE), runners: null }));
+    const detail = await services.queue.placeableDetail(repoKey, tags, repoName, QUEUE_PROBE).catch(async () => ({ eligible: await services.queue.placeable(repoKey, tags, repoName, QUEUE_PROBE), runners: null }));
     const message = detail.runners === null ? (detail.eligible === 0 ? noOnlineRunnerMessage({ runners: [] }, tags) : null) : noOnlineRunnerMessage(detail, tags);
     return message === null ? { ok: true } : { ok: false, message };
   } catch {

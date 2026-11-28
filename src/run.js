@@ -22,6 +22,7 @@ import { argvFingerprint } from './cpu-estimates.js';
 import { readHistoryRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
+import { repoName, originUrlOf } from './repo-name.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
 import { checkRunnable, effectiveRequiresTags } from './run-tags.js';
@@ -486,6 +487,7 @@ export async function runCommand({
   // re-enable the local budget check, not just omit `ticket.remote`.
   const remoteWorktreeRoot = remoteWanted ? resolveWorktreeRoot(cwd) : null;
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
+  const submitRepoName = remoteEligible ? repoName(originUrlOf(remoteWorktreeRoot), { baseDir: remoteWorktreeRoot }) : undefined;
   if (remoteEligible) {
     const hostOnly = hostOnlyPaths(cmd, { worktreeRoot: remoteWorktreeRoot, cwd });
     if (hostOnly.length > 0) {
@@ -750,7 +752,7 @@ export async function runCommand({
   // can be BEHIND the mark, which would back-date the origin and invent age. The origin is left null instead, and
   // `enqueue` assigns `nowEff` under the lock, so the ticket starts with zero age. `lane run` must not fail here.
   if (perRunTags.length > 0) {
-    const runnable = await checkRunnable({ cfg: globalCfg, root, repoKey: resolved.repoId, tags: resolved.requiresTags });
+    const runnable = await checkRunnable({ cfg: globalCfg, root, repoKey: resolved.repoId, repoName: submitRepoName, tags: resolved.requiresTags });
     if (!runnable.ok) {
       process.stderr.write(`lane run: ${runnable.message}\n`);
       return { exitCode: NO_RUNNER_EXIT_CODE };
@@ -907,6 +909,7 @@ export async function runCommand({
       worktreeRoot: remoteWorktreeRoot,
       relCwd,
       repoKey: resolved.repoId,
+      repoName: submitRepoName,
       weight,
       cpuCores: resources.cpuCores,
       ...(maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores } : {}),

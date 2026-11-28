@@ -24,13 +24,13 @@ const CFG = {
 /** Services and callbacks that record every touch, so a test can say "nothing was called". */
 function spies({ placeable = 2, ready = { ready: true }, lifecycleRules = [], queueRef = 'ref' } = {}) {
   const calls = [];
-  const probes = { lifecycleDeadlines: [], queueRef: [], placeable: [] };
+  const probes = { lifecycleDeadlines: [], queueRef: [], placeable: [], placeableArgs: [] };
   const services = {
     available: true,
     s3: { getBucketLifecycle: async (bucket, options) => { calls.push(`lifecycle ${bucket}`); probes.lifecycleDeadlines.push(options?.deadlineMs); return { rules: lifecycleRules }; } },
     queue: {
       queueRef: async (options) => { calls.push('queueRef'); probes.queueRef.push(options); if (queueRef instanceof Error) throw queueRef; return queueRef; },
-      placeable: async (_repoKey, _tags, options) => { calls.push('placeable'); probes.placeable.push(options); if (placeable instanceof Error) throw placeable; return placeable; },
+      placeable: async (repoKey, tags, repoName, options) => { calls.push('placeable'); probes.placeable.push(options); probes.placeableArgs.push([repoKey, tags, repoName]); if (placeable instanceof Error) throw placeable; return placeable; },
     },
   };
   return {
@@ -103,6 +103,13 @@ const PLACEMENT = {
     const placed = await placeForPull({ ...s.input, pushChosen: false });
     assert.deepEqual([placed.route, placed.services === s.services], ['pull', true]);
     assert.deepEqual(s.probes.placeable, [QUEUE_PROBE], 'ld_placeable decides placement, so it is one short attempt too');
+  },
+
+  'the placement probe carries the repo name the submitter stamped, beside the repo key and the tags': async (load) => {
+    const { placeForPull } = await load('pull-placement.js');
+    const s = spies();
+    await placeForPull({ ...s.input, pushChosen: false, repoKey: '/repos/towerpower/.git', repoName: 'popovlabs/towerpower', requiresTags: ['fast'] });
+    assert.deepEqual(s.probes.placeableArgs, [['/repos/towerpower/.git', ['fast'], 'popovlabs/towerpower']]);
   },
 
   'a ticket this machine can admit or bypass now runs locally; otherwise it is enqueued': async (load) => {
@@ -327,7 +334,8 @@ const CANARIES = [
   ['readiness is kept under the state root: another process within five minutes reuses the verdict, a failure included, and does no I/O', 'pull-placement.js', ['stored?.key === key && ', '']],
   ['the readiness probes are one short attempt each: lifecycle reads carry a deadline and the queue login does not retry', 'pull-placement.js', ['deadlineMs: PULL_PROBE_DEADLINE_MS', 'deadlineMs: undefined']],
   ['the readiness probes are one short attempt each: lifecycle reads carry a deadline and the queue login does not retry', 'pull-placement.js', ['services.queue.queueRef(QUEUE_PROBE)', 'services.queue.queueRef()']],
-  ['a ticket this machine could never run is enqueued without asking whether it could run now', 'pull-placement.js', ['services.queue.placeable(repoKey, requiresTags, QUEUE_PROBE)', 'services.queue.placeable(repoKey, requiresTags)']],
+  ['a ticket this machine could never run is enqueued without asking whether it could run now', 'pull-placement.js', ['services.queue.placeable(repoKey, requiresTags, repoName, QUEUE_PROBE)', 'services.queue.placeable(repoKey, requiresTags, repoName)']],
+  ['the placement probe carries the repo name the submitter stamped, beside the repo key and the tags', 'pull-placement.js', ['services.queue.placeable(repoKey, requiresTags, repoName, QUEUE_PROBE)', 'services.queue.placeable(repoKey, requiresTags, undefined, QUEUE_PROBE)']],
   ['a probe option of one attempt makes the queue client send once; without it a transient failure is retried', 'queue-client.js', ['if (attempt < attempts && retryable', 'if (attempt < MAX_ATTEMPTS && retryable']],
   ['a ticket\'s requested tier maps onto the queue\'s 0-9 priority column, higher claimed first, unrequested as medium', 'priority.js', ['PULL_QUEUE_BAND_START[tierRank(tier)]', '0']],
   ['the finished result is a pure function of the publication block and the ledger entry, and the writer records one history row', 'pull-publication.js', ['const endedAt = acceptedAt ?? Date.now();', 'const endedAt = Date.now();']],

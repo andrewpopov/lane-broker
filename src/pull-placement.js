@@ -60,7 +60,7 @@ export function createPullReadiness({ root, ttlMs = PULL_READY_TTL_MS, now = Dat
 
 // a chosen push runner returns before any pull config, file or network is read; an unreachable pull side is `legacy`, never a half-placed enqueue
 export async function placeForPull({
-  root, pushChosen, cfg, repoKey, requiresTags = [], locallyIneligible, couldRunLocally, servicesFor = pullServices, readiness = createPullReadiness({ root }),
+  root, pushChosen, cfg, repoKey, repoName, requiresTags = [], locallyIneligible, couldRunLocally, servicesFor = pullServices, readiness = createPullReadiness({ root }),
 }) {
   if (pushChosen) return { route: 'push' };
   if (!pullConfigured(cfg)) return { route: 'legacy' };
@@ -69,7 +69,7 @@ export async function placeForPull({
   if (!verdict.ready) return { route: 'legacy', reason: `pull dispatch unavailable: ${verdict.reason}` };
   let placeable;
   try {
-    placeable = await services.queue.placeable(repoKey, requiresTags, QUEUE_PROBE);
+    placeable = await services.queue.placeable(repoKey, requiresTags, repoName, QUEUE_PROBE);
   } catch (err) {
     return { route: 'legacy', reason: `pull dispatch unavailable: ld_placeable failed: ${err.message}` };
   }

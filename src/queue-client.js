@@ -11,6 +11,8 @@ const MAX_ATTEMPTS = 6;
 const BACKOFF_BASE_MS = 100;
 const BACKOFF_CAP_MS = 2_000;
 const TOO_MANY_CONNECTIONS = '53300';
+// a database from before the 3-argument ld_placeable has only the 2-argument one
+const UNDEFINED_FUNCTION = '42883';
 // a 53300 happens before anything is sent, so every call retries it; a guard kill may follow a commit, so only idempotent calls retry that
 
 // SQL parameter types in order (a call sends as many as it has arguments, so a call that names none of the trailing defaults runs against an older schema); `idempotent` says whether a call that may already have committed can be sent again
@@ -21,8 +23,8 @@ const FUNCTIONS = {
   ld_list_mine: { types: ['text[]', 'int'], idempotent: true },
   ld_withdraw: { types: ['uuid'], idempotent: false },
   ld_cancel: { types: ['uuid'], idempotent: false },
-  ld_placeable: { types: ['text', 'text[]'], idempotent: true },
-  ld_placeable_detail: { types: ['text', 'text[]'], idempotent: true },
+  ld_placeable: { types: ['text', 'text[]', 'text'], idempotent: true },
+  ld_placeable_detail: { types: ['text', 'text[]', 'text'], idempotent: true },
   // lane_admin only (`lane pull gc`); every one is safe to send again
   ld_prune_candidates: { types: ['interval', 'interval', 'timestamptz', 'uuid', 'int'], idempotent: true },
   ld_prune: { types: ['uuid[]', 'interval'], idempotent: true },
@@ -121,6 +123,15 @@ export function createQueueClient({
     }
   }
 
+  async function withTwoArgFallback(name, repoKey, requiresTags, repoName, options) {
+    try {
+      return await invoke(name, [repoKey, requiresTags, repoName ?? null], options);
+    } catch (err) {
+      if (err.code !== UNDEFINED_FUNCTION) throw err;
+      return invoke(name, [repoKey, requiresTags], options);
+    }
+  }
+
   return {
         queueRef: (options) => invoke('ld_queue_ref', [], options),
 
@@ -141,9 +152,9 @@ export function createQueueClient({
 
         cancel: (id) => invoke('ld_cancel', [id]),
 
-        placeable: (repoKey, requiresTags, options) => invoke('ld_placeable', [repoKey, requiresTags], options),
+        placeable: (repoKey, requiresTags, repoName, options) => withTwoArgFallback('ld_placeable', repoKey, requiresTags, repoName, options),
 
-        placeableDetail: (repoKey, requiresTags, options) => invoke('ld_placeable_detail', [repoKey, requiresTags], options),
+        placeableDetail: (repoKey, requiresTags, repoName, options) => withTwoArgFallback('ld_placeable_detail', repoKey, requiresTags, repoName, options),
 
         pruneCandidates: ({ objectsAfterMs, rowsAfterMs, after = null, limit = 200 }) =>
       invoke('ld_prune_candidates', [intervalOf(objectsAfterMs), intervalOf(rowsAfterMs), after?.finished_at ?? null, after?.id ?? null, limit]),
