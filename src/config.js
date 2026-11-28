@@ -17,6 +17,21 @@ import { readOfflineMarks, applyOfflineMarks } from './runner-offline.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
+export const DEADLINE_MIN_MS = 60_000;
+export const DEADLINE_MAX_MS = 86_400_000;
+export const DEADLINE_ENFORCEMENT_MODES = Object.freeze(['audit', 'enforce']);
+
+/** The shape problem with a run deadline in ms, or null. */
+export function deadlineProblem(ms) {
+  return Number.isInteger(ms) && ms >= DEADLINE_MIN_MS && ms <= DEADLINE_MAX_MS ? null : `must be an integer number of milliseconds from ${DEADLINE_MIN_MS} to ${DEADLINE_MAX_MS}`;
+}
+
+/** CLI beats lane beats global; each is ms or null/undefined when absent. */
+export function resolveDeadline({ cli, lane, global }) {
+  if (cli != null) return { deadlineMs: cli, deadlineSource: 'cli' };
+  if (lane != null) return { deadlineMs: lane, deadlineSource: 'lane' };
+  return { deadlineMs: global, deadlineSource: 'global' };
+}
 
 export const DEFAULT_GLOBAL_CONFIG = {
   version: 1,
@@ -200,6 +215,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
   // The stall is recorded either way.
   noProgressTimeoutMs: 0,
+  // BRAIN-940: every run's wall-clock limit, from spawn; a lane (`deadlineMs`) or `--deadline` overrides it. 'audit' only records an overrun;
+  // 'enforce' (read on the executing host, never transported) kills it.
+  deadlineMs: 21_600_000,
+  deadlineEnforcement: 'audit',
   // BRAIN-576: a run that wrote NO output for this long is killed whatever its CPU does (exit 124, reason 'silence').
   // 0 (the default) never kills; opt a lane in per lane (`silenceTimeoutMs`). Catches a spinning-but-wedged process the
   // no-progress watchdog (which needs CPU idle too) never fires on.
@@ -498,6 +517,8 @@ function validateGlobalConfig(cfg, sourcePath) {
   }
   assert(Number.isInteger(cfg.noProgressTimeoutMs) && cfg.noProgressTimeoutMs >= 0, `${sourcePath}: "noProgressTimeoutMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.silenceTimeoutMs) && cfg.silenceTimeoutMs >= 0, `${sourcePath}: "silenceTimeoutMs" must be a non-negative integer`);
+  assert(deadlineProblem(cfg.deadlineMs) === null, `${sourcePath}: "deadlineMs" ${deadlineProblem(cfg.deadlineMs)}`);
+  assert(DEADLINE_ENFORCEMENT_MODES.includes(cfg.deadlineEnforcement), `${sourcePath}: "deadlineEnforcement" must be ${DEADLINE_ENFORCEMENT_MODES.map((m) => `"${m}"`).join(' or ')}`);
   assert(Number.isInteger(cfg.hungAfterMs) && cfg.hungAfterMs > 0, `${sourcePath}: "hungAfterMs" must be a positive integer`);
   assert(Number.isFinite(cfg.hungCpuCores) && cfg.hungCpuCores >= 0, `${sourcePath}: "hungCpuCores" must be a non-negative number`);
   assert(
@@ -912,6 +933,9 @@ function validateRepoConfig(cfg, sourcePath) {
         Number.isInteger(lane.noProgressTimeoutMs) && lane.noProgressTimeoutMs >= 0,
         `${sourcePath}: lane "${name}".noProgressTimeoutMs must be a non-negative integer (0 disables)`,
       );
+    }
+    if (lane.deadlineMs !== undefined) {
+      assert(deadlineProblem(lane.deadlineMs) === null, `${sourcePath}: lane "${name}".deadlineMs ${deadlineProblem(lane.deadlineMs)} (omit it to use the global value)`);
     }
     if (lane.silenceTimeoutMs !== undefined) {
       assert(
@@ -1588,7 +1612,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/maxExecutionCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteDepsCacheKeyFiles/remoteDepsCacheKeyFilesCoverInstallScripts/remoteOmitEscapingSymlinks/remoteExclude/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
+    // Inherit weight/cpuCores/minCpuCores/maxExecutionCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/deadlineMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteDepsCacheKeyFiles/remoteDepsCacheKeyFilesCoverInstallScripts/remoteOmitEscapingSymlinks/remoteExclude/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -1604,6 +1628,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       nice: templateCfg.nice,
       noProgressTimeoutMs: templateCfg.noProgressTimeoutMs,
       silenceTimeoutMs: templateCfg.silenceTimeoutMs,
+      deadlineMs: templateCfg.deadlineMs,
       remote: templateCfg.remote,
       localReason: templateCfg.localReason,
       requires: templateCfg.requires,
@@ -1669,6 +1694,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     noProgressTimeoutMs: Number.isInteger(laneCfg.noProgressTimeoutMs) ? laneCfg.noProgressTimeoutMs : null,
     // BRAIN-576: same shape for the silence watchdog
     silenceTimeoutMs: Number.isInteger(laneCfg.silenceTimeoutMs) ? laneCfg.silenceTimeoutMs : null,
+    // BRAIN-940: null falls through to the global `deadlineMs`; a lane may never turn the deadline off
+    deadlineMs: Number.isInteger(laneCfg.deadlineMs) ? laneCfg.deadlineMs : null,
     // BRAIN-255: how many same-key holders may run at once. Defaulted HERE
     // (not left null for a caller fallback like `nice` above) because 1 is
     // the load-bearing compatibility default for every lane that predates

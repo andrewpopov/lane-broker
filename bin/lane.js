@@ -48,7 +48,7 @@ import { pullGcCommand } from '../src/pull-gc.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--tag <tag>]... [--runner <name>] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--tag <tag>]... [--runner <name>] [--deadline <dur>] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -143,6 +143,10 @@ function parseRunArgs(args) {
       case '--tag':
       case '--runner':
         opts.runTags = [...(opts.runTags ?? []), runTagFromFlag(a, flagArgs[++i])];
+        break;
+      // Validated (exit 64) by runCommand.
+      case '--deadline':
+        opts.deadline = flagArgs[++i] ?? '';
         break;
       case '--no-cache':
         opts.noCache = true;
@@ -297,6 +301,7 @@ async function main() {
         exclusivePurpose: opts.exclusivePurpose,
         exclusiveDeadline: opts.exclusiveDeadline,
         runTags: opts.runTags,
+        deadline: opts.deadline,
         noCache: opts.noCache,
         noReuse: opts.noReuse,
         retryReason: opts.retryReason,

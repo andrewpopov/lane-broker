@@ -314,7 +314,23 @@ const PUBLICATION = {
   },
 };
 
-const ALL = { ...PLACEMENT, ...EXIT_MAPPING, ...GUARD, ...HISTORY, ...TIMEOUT, ...PRIORITY, ...PUBLICATION };
+const RELAY = 'a run-limit or deadline kill in the runner\'s result is relayed into the finished result with its reason and window; an ordinary result relays none';
+
+const SETTLEMENT = {
+  [RELAY]: async (load) => {
+    const { publicationOf, pullFinishedResult } = await load('pull-publication.js');
+    const publication = publicationOf({ id: '00000000-0000-4000-8000-0000000000c2', key: 'r:default', repoId: 'r', lane: 'default', createdAt: 1_000 }, { placement: null, attemptStartedAt: 900, refusalExit: 76 });
+    const settle = (result) => pullFinishedResult(publication, { decision: { kind: 'finished', exit: 124 }, host: 'agentbox', acceptedAt: 5_000, result: { kind: 'completed', runMs: 2_000, ...result } }, null, {});
+    const runLimit = settle({ reason: 'run-limit', runLimitMs: 21_600_000, guard: 'run-limit', stopProven: true });
+    assert.deepEqual([runLimit.reason, runLimit.runLimitMs, runLimit.guard, runLimit.stopProven], ['run-limit', 21_600_000, 'run-limit', true]);
+    const deadline = settle({ reason: 'deadline_exceeded', deadlineMs: 60_000, deadline: { ms: 60_000, source: 'cli', mode: 'enforce' }, stopProven: false });
+    assert.deepEqual([deadline.reason, deadline.deadlineMs, deadline.deadline, deadline.stopProven], ['deadline_exceeded', 60_000, { ms: 60_000, source: 'cli', mode: 'enforce' }, false]);
+    const ordinary = settle({ reason: 'publisher-gone', runLimitMs: 5 });
+    assert.deepEqual(['reason', 'runLimitMs', 'guard', 'stopProven'].filter((key) => key in ordinary), []);
+  },
+};
+
+const ALL = { ...PLACEMENT, ...EXIT_MAPPING, ...GUARD, ...HISTORY, ...TIMEOUT, ...PRIORITY, ...PUBLICATION, ...SETTLEMENT };
 
 const CANARIES = [
   ['D6: a chosen push runner returns before any pull config, file, store or queue is touched', 'pull-placement.js', ["  if (pushChosen) return { route: 'push' };\n", '']],
@@ -332,6 +348,7 @@ const CANARIES = [
   ['a ticket\'s requested tier maps onto the queue\'s 0-9 priority column, higher claimed first, unrequested as medium', 'priority.js', ['PULL_QUEUE_BAND_START[tierRank(tier)]', '0']],
   ['the finished result is a pure function of the publication block and the ledger entry, and the writer records one history row', 'pull-publication.js', ['const endedAt = acceptedAt ?? Date.now();', 'const endedAt = Date.now();']],
   ['the finished result is a pure function of the publication block and the ledger entry, and the writer records one history row', 'pull-publication.js', ['rebuilt, placement: publication.placement', 'placement: publication.placement']],
+  [RELAY, 'pull-publication.js', ['    ...relayedSettlement(result),\n', '']],
   ['readiness refuses a missing credential file, an enabled lifecycle rule and a queue login that fails', 'pull-placement.js', ["  if (refusals.length > 0) return { ready: false, reason: refusals[0] };\n", '']],
   ['every settled outcome ends the supervisor with its own exit and an unresolved one with 1; a withdraw is not an exit', 'pull-ticket.js', ['outcome.exitCode : LOST_EXIT;', 'outcome.exitCode : 1;']],
   ['every settled outcome ends the supervisor with its own exit and an unresolved one with 1; a withdraw is not an exit', 'pull-ticket.js', ['return Number.isInteger(outcome.exitCode) ? outcome.exitCode : LOST_EXIT;', 'return LOST_EXIT;']],

@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import { NoProgressWatchdog, NO_PROGRESS_REASON, SILENCE_REASON, formatWindow, noProgressMessage, silenceMessage } from '../no-progress.js';
 import { DescendantTracker } from '../descendants.js';
 import { readLease } from '../lease.js';
+import { RUN_LIMIT_REASON } from '../reasons.js';
 
-export const RUN_LIMIT_REASON = 'run-limit';
+export { RUN_LIMIT_REASON };
 export const runLimitMessage = (limitMs) => `lane run: still running after ${formatWindow(limitMs)} — killed (run limit)\n`;
 
 /** A header value (absent = undefined) overrides the runner's global, and an explicit 0 is the lane's own "off". */

@@ -66,6 +66,7 @@ import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbac
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { ranOnLine, ranOnRecord, relayedRanOn } from './ran-on.js';
+import { relayedSettlement } from './reasons.js';
 import { maybeDailyGc, createLeaseTmpDir, retireLeaseTmpDir, tmpEnv } from './gc.js';
 import { EXCLUSIVE_DEADLINE_EXIT, EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpiredMessage } from './exclusive.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
@@ -1912,8 +1913,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       ...redispatchFields(),
       ...artifactFields,
       ...(omittedSymlinks.length > 0 ? { remoteOmittedSymlinks: omittedSymlinks.length, remoteOmittedSymlinkNames: omittedSymlinks.slice(0, MAX_OMITTED_SYMLINKS_LISTED) } : {}),
-      ...(noProgress ? { reason: NO_PROGRESS_REASON, noProgressTimeoutMs: dispatch.result.noProgressTimeoutMs } : {}),
-      ...(silence ? { reason: SILENCE_REASON, silenceTimeoutMs: dispatch.result.silenceTimeoutMs } : {}),
+      ...relayedSettlement(dispatch.result),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       // BRAIN-700: the client reports a signalled remote child as exit 1, so the runner's own signal is kept to tell it from a test failure

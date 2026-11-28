@@ -1,4 +1,4 @@
-import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
+import { relayedSettlement } from './reasons.js';
 import { readEnvelope } from './pull-envelope.js';
 import { remoteCpuAllocation } from './remote-client.js';
 import { relayedDeps, relayedTransfer, relayedUsage } from './remote-relay.js';
@@ -24,8 +24,6 @@ export function pullFinishedResult(publication, { result, decision, host, accept
   const endedAt = acceptedAt ?? Date.now();
   const runMs = Number.isFinite(result.runMs) && result.runMs >= 0 ? result.runMs : null;
   const waited = runMs === null ? null : Math.max(0, endedAt - publication.createdAt - runMs);
-  const noProgress = result.reason === NO_PROGRESS_REASON && Number.isFinite(result.noProgressTimeoutMs);
-  const silence = result.reason === SILENCE_REASON && Number.isFinite(result.silenceTimeoutMs);
   return {
     id: publication.enriched.id,
     exit: decision.exit,
@@ -40,8 +38,7 @@ export function pullFinishedResult(publication, { result, decision, host, accept
     ...relayedTransfer(null, result),
     ...relayedPhases({ result }),
     ...extra,
-    ...(noProgress ? { reason: NO_PROGRESS_REASON, noProgressTimeoutMs: result.noProgressTimeoutMs } : {}),
-    ...(silence ? { reason: SILENCE_REASON, silenceTimeoutMs: result.silenceTimeoutMs } : {}),
+    ...relayedSettlement(result),
     remoteKind: result.kind,
     remotePhase: decision.phase ?? null,
     ...(result.signal ? { remoteSignal: result.signal } : {}),
