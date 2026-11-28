@@ -603,6 +603,9 @@ DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, 
 DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[]);
 -- BRAIN-1106 (migration 010) adds the trailing p_free_weight, p_weight_limit to ld_claim.
 DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint);
+-- BRAIN-1116 (migration 013): eligible takes the repo mode, and scarcity renames its second parameter, which CREATE OR REPLACE refuses.
+DROP FUNCTION IF EXISTS lane_dispatch.eligible(text[], text, text[], text[]);
+DROP FUNCTION IF EXISTS lane_dispatch.scarcity(text[], text);
 -- PKG-437 adds the trailing p_reason to return_to_queue (an internal function; no caller outside this file).
 DROP FUNCTION IF EXISTS lane_dispatch.return_to_queue(uuid, timestamptz);
 
@@ -711,18 +714,26 @@ BEGIN
   RETURN coalesce(p_row_state IN ('claimed','running') AND p_row_epoch = p_epoch AND p_row_token = p_token AND p_row_host = p_host, false);
 END $$;
 
-CREATE OR REPLACE FUNCTION lane_dispatch.eligible(p_requires_tags text[], p_repo_key text, p_tags text[], p_allowed_repos text[]) RETURNS boolean
+-- A ticket's repo name, as its submitter stamped it in the header; a ticket with no name is an ad hoc clone and carries the name 'adhoc'.
+CREATE OR REPLACE FUNCTION lane_dispatch.ticket_repo(p_header jsonb) RETURNS text
+LANGUAGE plpgsql IMMUTABLE SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN coalesce(nullif(p_header->>'repoName', ''), 'adhoc');
+END $$;
+
+-- Under enforce a runner claims only the repos its list names ('*' names nothing); open and audit ignore the list.
+CREATE OR REPLACE FUNCTION lane_dispatch.eligible(p_requires_tags text[], p_repo_name text, p_tags text[], p_allowed_repos text[], p_repo_mode text) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
-  RETURN p_requires_tags <@ p_tags AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos));
+  RETURN p_requires_tags <@ p_tags AND (p_repo_mode <> 'enforce' OR (p_repo_name = ANY (p_allowed_repos)) IS TRUE);
 END $$;
 
 -- Agent principals that could ever run the ticket: the order key that lets a host take what few hosts can run first, and what ld_placeable reports.
-CREATE OR REPLACE FUNCTION lane_dispatch.scarcity(p_requires_tags text[], p_repo_key text) RETURNS int
+CREATE OR REPLACE FUNCTION lane_dispatch.scarcity(p_requires_tags text[], p_repo_name text) RETURNS int
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
   RETURN (SELECT count(*)::int FROM lane_dispatch.principals p
-           WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos));
+           WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_name, p.tags, p.allowed_repos, p.repo_mode));
 END $$;
 
 -- Seconds a non-high must wait before it ties a high (3 x the 20 minute age window); eff_score and the claim order share it.
@@ -776,17 +787,65 @@ BEGIN
   RETURN lane_dispatch.claim_view(v_prev.ticket, v_prev.epoch, v_prev.claim_token);
 END $$;
 
+-- The 6-argument form (an older lane-runner-admin) leaves an existing principal's repo_mode alone; a new principal starts at enforce.
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_set_principal(p_login_role text, p_kind text, p_host text, p_tags text[], p_allowed_repos text[], p_max_claims int)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  PERFORM lane_dispatch.ld_set_principal(p_login_role, p_kind, p_host, p_tags, p_allowed_repos, p_max_claims, NULL);
+END $$;
+
+-- The pre-read picks the mode of the row to insert, so the guard trigger (which fires before ON CONFLICT is resolved) sees the mode the host really has.
+-- The conflict path keeps the stored mode whenever none was given, so a concurrent insert the pre-read missed cannot flip it.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_set_principal(p_login_role text, p_kind text, p_host text, p_tags text[], p_allowed_repos text[], p_max_claims int, p_repo_mode text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_mode text;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   IF p_host IS NOT NULL AND p_host !~ '^[a-z0-9][a-z0-9-]{0,54}$' THEN
     RAISE EXCEPTION 'host % is not a valid channel name', p_host USING ERRCODE = '22023';
   END IF;
-  INSERT INTO lane_dispatch.principals (login_role, kind, host, tags, allowed_repos, max_claims)
-    VALUES (p_login_role, p_kind, p_host, coalesce(p_tags, '{}'), coalesce(p_allowed_repos, '{}'), coalesce(p_max_claims, 1))
+  SELECT p.repo_mode INTO v_mode FROM lane_dispatch.principals p WHERE p.login_role = p_login_role FOR UPDATE;
+  INSERT INTO lane_dispatch.principals (login_role, kind, host, tags, allowed_repos, max_claims, repo_mode)
+    VALUES (p_login_role, p_kind, p_host, coalesce(p_tags, '{}'), coalesce(p_allowed_repos, '{}'), coalesce(p_max_claims, 1), coalesce(p_repo_mode, v_mode, 'enforce'))
     ON CONFLICT (login_role) DO UPDATE SET kind = EXCLUDED.kind, host = EXCLUDED.host, tags = EXCLUDED.tags,
-                                           allowed_repos = EXCLUDED.allowed_repos, max_claims = EXCLUDED.max_claims;
+                                           allowed_repos = EXCLUDED.allowed_repos, max_claims = EXCLUDED.max_claims,
+                                           repo_mode = CASE WHEN p_repo_mode IS NULL THEN lane_dispatch.principals.repo_mode ELSE EXCLUDED.repo_mode END;
+END $$;
+
+-- Moves one agent between open, audit and enforce without touching its list: the per-host rollback is ld_set_repo_mode(host, 'open').
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_set_repo_mode(p_host text, p_repo_mode text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  UPDATE lane_dispatch.principals SET repo_mode = p_repo_mode WHERE host = p_host AND kind = 'agent';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no agent principal for host %', p_host USING ERRCODE = 'P0002';
+  END IF;
+END $$;
+
+-- Default-deny needs a list to deny against: an enforcing row never holds '*', and a change to enforce or to the list never leaves it empty.
+-- A row whose mode and list are unchanged passes (a credential re-add, tags, max_claims), and a new principal may start enforcing an empty list.
+CREATE OR REPLACE FUNCTION lane_dispatch.principals_repo_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  IF NEW.repo_mode = 'enforce' THEN
+    IF '*' = ANY (NEW.allowed_repos) THEN
+      RAISE EXCEPTION 'principal % enforces repo authorization, so allowed_repos cannot hold *', NEW.login_role USING ERRCODE = '23514';
+    END IF;
+    IF TG_OP = 'UPDATE' AND cardinality(NEW.allowed_repos) = 0
+       AND (NEW.repo_mode IS DISTINCT FROM OLD.repo_mode OR NEW.allowed_repos IS DISTINCT FROM OLD.allowed_repos) THEN
+      RAISE EXCEPTION 'principal % would enforce an empty allowed_repos and claim nothing', NEW.login_role USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.principals') AND attname = 'repo_mode' AND NOT attisdropped) THEN
+    CREATE OR REPLACE TRIGGER principals_repo_guard BEFORE INSERT OR UPDATE ON lane_dispatch.principals
+      FOR EACH ROW EXECUTE FUNCTION lane_dispatch.principals_repo_guard();
+  END IF;
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue(p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb, p_header jsonb, p_snapshot jsonb,
@@ -927,7 +986,7 @@ DECLARE v_me record; v_out jsonb; v_now timestamptz; v_protocol int; v_held int;
         v_head record; v_t record; v_grant real;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
-  SELECT p.host, p.tags, p.allowed_repos, p.max_claims INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;
+  SELECT p.host, p.tags, p.allowed_repos, p.max_claims, p.repo_mode INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'no agent principal for %', session_user USING ERRCODE = '42501';
   END IF;
@@ -944,7 +1003,7 @@ BEGIN
   IF v_held >= v_me.max_claims THEN RETURN jsonb_build_object('status', 'none'); END IF;
   SELECT t.id, t.cpu_cores, lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) AS need INTO v_t FROM lane_dispatch.tickets t
    WHERE t.state = 'queued' AND NOT t.cancel_requested AND t.min_protocol <= v_protocol AND t.not_before <= v_now
-     AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
+     AND lane_dispatch.eligible(t.requires_tags, lane_dispatch.ticket_repo(t.header), v_me.tags, v_me.allowed_repos, v_me.repo_mode)
      AND (NOT t.avoid_tags && v_me.tags OR v_now - t.created_at >= v_avoid_grace)
      AND lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) <= p_free_cpu AND t.memory_bytes <= p_free_mem
      AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
@@ -953,14 +1012,14 @@ BEGIN
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
                   AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
-            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
+            lane_dispatch.scarcity(t.requires_tags, lane_dispatch.ticket_repo(t.header)), t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 'none'); END IF;
   v_token := gen_random_uuid();
   IF p_capacity_cpu IS NOT NULL AND v_held > 0 THEN
     SELECT t.id, lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) AS need, t.memory_bytes,
            lane_dispatch.ticket_weight(t.header, p_weight_limit) AS weight, CASE WHEN t.ages THEN v_now - t.created_at ELSE interval '0' END AS credited INTO v_head FROM lane_dispatch.tickets t
    WHERE t.state = 'queued' AND NOT t.cancel_requested AND t.min_protocol <= v_protocol AND t.not_before <= v_now
-     AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
+     AND lane_dispatch.eligible(t.requires_tags, lane_dispatch.ticket_repo(t.header), v_me.tags, v_me.allowed_repos, v_me.repo_mode)
      AND (NOT t.avoid_tags && v_me.tags OR v_now - t.created_at >= v_avoid_grace)
      AND lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) <= p_capacity_cpu AND t.memory_bytes <= coalesce(p_capacity_mem, p_free_mem)
      AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
@@ -968,7 +1027,7 @@ BEGIN
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
                   AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
-            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1;
+            lane_dispatch.scarcity(t.requires_tags, lane_dispatch.ticket_repo(t.header)), t.created_at, t.id LIMIT 1;
     IF FOUND AND extract(epoch FROM v_head.credited) >= lane_dispatch.age_horizon_s()
        AND NOT (v_head.need <= p_free_cpu AND v_head.memory_bytes <= p_free_mem AND v_head.weight <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)) THEN
       RETURN jsonb_build_object('status', 'none', 'reserved_for', v_head.id);
@@ -987,12 +1046,13 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_needed_tools() RETURNS text[]
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record;
+DECLARE v_me record; v_mode text;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  SELECT p.repo_mode INTO v_mode FROM lane_dispatch.principals p WHERE p.login_role = session_user;
   RETURN (SELECT coalesce(array_agg(DISTINCT r.name ORDER BY r.name), '{}') FROM lane_dispatch.tickets t, unnest(t.requires) AS r(name)
-           WHERE t.state = 'queued' AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos));
+           WHERE t.state = 'queued' AND lane_dispatch.eligible(t.requires_tags, lane_dispatch.ticket_repo(t.header), v_me.tags, v_me.allowed_repos, v_mode));
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_start(p_id uuid, p_epoch int, p_token uuid) RETURNS boolean
@@ -1177,17 +1237,25 @@ BEGIN
                                   p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores);
 END $$;
 
-CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable(p_repo_key text, p_requires_tags text[]) RETURNS int
+-- p_repo_key is the lease key the legacy probe sent; only the name decides who can run the ticket. The 2-argument form is a submitter that sends no name: an ad hoc ticket.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable(p_repo_key text, p_requires_tags text[], p_repo_name text) RETURNS int
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
-  RETURN lane_dispatch.scarcity(p_requires_tags, p_repo_key);
+  RETURN lane_dispatch.scarcity(p_requires_tags, coalesce(nullif(p_repo_name, ''), 'adhoc'));
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable(p_repo_key text, p_requires_tags text[]) RETURNS int
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN lane_dispatch.ld_placeable(p_repo_key, p_requires_tags, NULL);
 END $$;
 
 -- PKG-468: who could claim a ticket with these tags, and when each last polled the queue (NULL = never registered), so `lane run --runner x` can say why nothing will take it.
-CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable_detail(p_repo_key text, p_requires_tags text[]) RETURNS jsonb
+-- Named like ld_placeable: the 3-argument form scores the repo name it is sent, the 2-argument form a ticket with no name (adhoc).
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable_detail(p_repo_key text, p_requires_tags text[], p_repo_name text) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record; v_runners jsonb;
 BEGIN
@@ -1195,8 +1263,15 @@ BEGIN
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
   SELECT coalesce(jsonb_agg(jsonb_build_object('host', p.host, 'seenAgoS', floor(extract(epoch FROM lane_dispatch.now() - r.last_seen))) ORDER BY p.host), '[]'::jsonb) INTO v_runners
     FROM lane_dispatch.principals p LEFT JOIN lane_dispatch.runners r ON r.host = p.host
-   WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos);
+   WHERE p.kind = 'agent' AND p.max_claims > 0
+     AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), coalesce(nullif(p_repo_name, ''), 'adhoc'), p.tags, p.allowed_repos, p.repo_mode);
   RETURN jsonb_build_object('eligible', jsonb_array_length(v_runners), 'runners', v_runners);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable_detail(p_repo_key text, p_requires_tags text[]) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN lane_dispatch.ld_placeable_detail(p_repo_key, p_requires_tags, NULL);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_prune_candidates(p_objects_after interval, p_rows_after interval, p_after_finished timestamptz DEFAULT NULL,
@@ -1333,16 +1408,54 @@ END $$;
 -- lane_dispatch nor a column grant there, and they never expose claim_token, login_role, or a ticket's header beyond its argv hash.
 -- A view is checked when it is created, unlike a plpgsql body, so they wait for the columns they read (migration 006's requeues).
 DO $$
+DECLARE v_repo_mode boolean := EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.principals') AND attname = 'repo_mode' AND NOT attisdropped);
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.tickets') AND attname = 'requeues' AND NOT attisdropped) THEN
     CREATE OR REPLACE VIEW lane.pull_tickets AS
       SELECT id, repo_key, lane, state, host, cpu_cores, requeues, result, created_at, started_at, finished_at, requires_tags,
              md5(header ->> 'argv') AS argv_md5
         FROM lane_dispatch.tickets;
-    CREATE OR REPLACE VIEW lane.pull_principals AS
-      SELECT host, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE kind = 'agent';
+    -- repo_mode is appended last; a view cannot drop a column, so once it is there every apply keeps it.
+    IF v_repo_mode THEN
+      CREATE OR REPLACE VIEW lane.pull_principals AS
+        SELECT host, tags, allowed_repos, max_claims, repo_mode FROM lane_dispatch.principals WHERE kind = 'agent';
+    ELSE
+      CREATE OR REPLACE VIEW lane.pull_principals AS
+        SELECT host, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE kind = 'agent';
+    END IF;
     CREATE OR REPLACE VIEW lane.pull_runners AS
       SELECT host, last_seen FROM lane_dispatch.runners;
+  END IF;
+  -- BRAIN-1116: pull_repo_audit is bounded to the states the collector reads once a minute (queued, held, finished in the last 15 minutes),
+  -- one branch per partial index, with coverage worked out once per distinct (repo, requires_tags) rather than per ticket. The submit login is a role name, not a secret.
+  IF v_repo_mode THEN
+    CREATE OR REPLACE VIEW lane.pull_repo_audit AS
+      WITH scope AS (
+        SELECT t.owner, t.state, t.host, t.requires_tags, t.header FROM lane_dispatch.tickets t WHERE t.state = 'queued'
+        UNION ALL
+        SELECT t.owner, t.state, t.host, t.requires_tags, t.header FROM lane_dispatch.tickets t WHERE t.state IN ('claimed','running')
+        UNION ALL
+        SELECT t.owner, t.state, t.host, t.requires_tags, t.header FROM lane_dispatch.tickets t
+         WHERE t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at > now() - interval '15 minutes'
+      ), tagged AS (
+        SELECT s.owner, s.state, s.host, s.requires_tags, s.header, lane_dispatch.ticket_repo(s.header) AS repo FROM scope s
+      ), coverage AS (
+        SELECT k.repo, k.requires_tags,
+               EXISTS (SELECT 1 FROM lane_dispatch.principals p
+                        WHERE p.kind = 'agent' AND p.max_claims > 0 AND k.requires_tags <@ p.tags AND k.repo = ANY (p.allowed_repos)) AS covered_configured,
+               EXISTS (SELECT 1 FROM lane_dispatch.principals p JOIN lane_dispatch.runners r ON r.host = p.host
+                        WHERE p.kind = 'agent' AND p.max_claims > 0 AND k.requires_tags <@ p.tags AND k.repo = ANY (p.allowed_repos)
+                          AND r.last_seen > now() - interval '10 minutes') AS covered_live
+          FROM (SELECT DISTINCT repo, requires_tags FROM tagged) k
+      )
+      SELECT r.repo, r.named, r.submitter, r.submitter_version, r.state, r.host, r.covered_configured, r.covered_live, r.holder_would_deny, count(*) AS n
+        FROM (SELECT g.repo, nullif(g.header->>'repoName', '') IS NOT NULL AS named, g.owner AS submitter, g.header->>'brokerVersion' AS submitter_version,
+                     g.state, g.host, c.covered_configured, c.covered_live,
+                     g.host IS NOT NULL AND ((g.repo = ANY (h.allowed_repos)) IS NOT TRUE) AS holder_would_deny
+                FROM tagged g
+                JOIN coverage c ON c.repo = g.repo AND c.requires_tags = g.requires_tags
+                LEFT JOIN lane_dispatch.principals h ON h.host = g.host AND h.kind = 'agent') r
+       GROUP BY r.repo, r.named, r.submitter, r.submitter_version, r.state, r.host, r.covered_configured, r.covered_live, r.holder_would_deny;
   END IF;
   -- PKG-437: merge-train's read contract. The _v1 column list is final; a change is a new view. dispatch_key is filled in place by PKG-438.
   -- updated_at is monotonic: status_changed_at is stamped at every state transition and log_state mark, late_result_at at every late result.
@@ -1384,12 +1497,15 @@ BEGIN
   IF to_regclass('lane.pull_tickets') IS NOT NULL THEN
     GRANT SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners TO lane_reader;
   END IF;
+  IF to_regclass('lane.pull_repo_audit') IS NOT NULL THEN
+    GRANT SELECT ON lane.pull_repo_audit TO lane_reader;
+  END IF;
 END $$;
 -- The views are single-table and so auto-updatable: the blanket grant above would let lane_admin write ticket state through them, past the fence.
 DO $$
 DECLARE v text;
 BEGIN
-  FOREACH v IN ARRAY ARRAY['pull_tickets', 'pull_principals', 'pull_runners', 'ticket_status_v1'] LOOP
+  FOREACH v IN ARRAY ARRAY['pull_tickets', 'pull_principals', 'pull_runners', 'pull_repo_audit', 'ticket_status_v1'] LOOP
     IF to_regclass('lane.' || v) IS NOT NULL THEN
       EXECUTE format('REVOKE ALL ON lane.%I FROM lane_admin', v);
       EXECUTE format('GRANT SELECT ON lane.%I TO lane_admin', v);
@@ -1426,7 +1542,11 @@ GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_disp
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_get(uuid),
   lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb),
   lane_dispatch.ld_log_read(uuid, int, int), lane_dispatch.ld_log_ack(uuid, int, int), lane_dispatch.ld_queue_ref(),
-  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_placeable(text, text[]), lane_dispatch.ld_placeable_detail(text, text[]) TO lane_submit;
-GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_reap(interval, interval, interval),
+  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_placeable(text, text[]), lane_dispatch.ld_placeable_detail(text, text[]),
+  lane_dispatch.ld_placeable(text, text[], text), lane_dispatch.ld_placeable_detail(text, text[], text) TO lane_submit;
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_set_principal(text, text, text, text[], text[], int, text),
+  lane_dispatch.ld_set_repo_mode(text, text), lane_dispatch.ld_reap(interval, interval, interval),
   lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval), lane_dispatch.ld_prune_candidates(interval, interval, timestamptz, uuid, int),
   lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_prune_chunks(interval, int), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;
+-- The audit view calls ticket_repo as lane_reader, and EXECUTE is checked against the caller, not the view owner. The function is pure: it reads only its argument.
+GRANT EXECUTE ON FUNCTION lane_dispatch.ticket_repo(jsonb) TO lane_reader, lane_admin;

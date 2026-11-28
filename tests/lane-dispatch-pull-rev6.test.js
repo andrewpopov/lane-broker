@@ -350,7 +350,7 @@ const GUARDS = {
     await setNow(w, at(0));
     const s1 = await w.as(logins.s1);
     await enqueue(s1, tid(1), { tags: ['fast'], avoidTags: ['fast'] });
-    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['fast']), 1);
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['fast'], 'repoA'), 1);
   },
 };
 
@@ -380,21 +380,21 @@ const CANARIES = [
   ['two claims by one login serialise on its principal row, so max_claims holds', "p.kind = 'agent' FOR UPDATE;", "p.kind = 'agent';"],
   ['ld_claim reads the principal under its lock: a max_claims change committed while a claim waits is seen by that claim', "p.kind = 'agent' FOR UPDATE;", "p.kind = 'agent';"],
   ['ld_claim reads the principal under its lock: a max_claims change committed while a claim waits is seen by that claim',
-    "SELECT p.host, p.tags, p.allowed_repos, p.max_claims INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;\n  IF NOT FOUND THEN\n    RAISE EXCEPTION 'no agent principal for %', session_user USING ERRCODE = '42501';\n  END IF;",
+    "SELECT p.host, p.tags, p.allowed_repos, p.max_claims, p.repo_mode INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;\n  IF NOT FOUND THEN\n    RAISE EXCEPTION 'no agent principal for %', session_user USING ERRCODE = '42501';\n  END IF;",
     "SELECT * INTO v_me FROM lane_dispatch.me('agent');\n  PERFORM 1 FROM lane_dispatch.principals p WHERE p.login_role = session_user FOR UPDATE;"],
   ['fresh highs of one score go by scarcity: the scarce host takes the scarce ticket',
     "            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0\n                  AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,\n",
     "            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0 THEN t.created_at END NULLS LAST,\n"],
   ['aged work is claimed before fresh scarcer work once it has reached the high level',
     "            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0\n                  AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,\n", ''],
-  ['a host takes the ticket fewer hosts can run first, within a tier', 'lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id', 't.created_at, t.id'],
+  ['a host takes the ticket fewer hosts can run first, within a tier', 'lane_dispatch.scarcity(t.requires_tags, lane_dispatch.ticket_repo(t.header)), t.created_at, t.id', 't.created_at, t.id'],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'v_credit >= lane_dispatch.age_horizon_s()', 'v_credit >= 360000'],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'ELSE 1.98 END', 'ELSE 2.0 END'],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'CASE WHEN p_priority >= 9 THEN 0.01 ELSE 0 END', '0'],
   ['an aged low ties a fresh priority 8 and wins on age, and a fresh priority 9 beats both', 'CASE WHEN p_priority >= 9 THEN 0.01 ELSE 0 END', '0'],
   ['an aged low ties a fresh priority 8 and wins on age, and a fresh priority 9 beats both', 'v_credit >= lane_dispatch.age_horizon_s()', 'v_credit >= 360000'],
   ['an aged low ties a fresh priority 8 and wins on age, and a fresh priority 9 beats both',
-    "THEN t.created_at END NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1", "THEN NULL END NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.id DESC LIMIT 1"],
+    "THEN t.created_at END NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, lane_dispatch.ticket_repo(t.header)), t.created_at, t.id LIMIT 1", "THEN NULL END NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, lane_dispatch.ticket_repo(t.header)), t.id DESC LIMIT 1"],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'CASE WHEN p_ages THEN greatest(p_age_s, 0) ELSE 0 END', 'greatest(p_age_s, 0)'],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', RESTORE_STAMP, "SET state = 'lost', result = lane_dispatch.lost_result('queue-restored', epoch)"],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', "finished_at = CASE WHEN v_state = 'queued' THEN NULL ELSE p_now END", 'finished_at = NULL'],

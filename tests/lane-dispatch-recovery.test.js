@@ -57,6 +57,7 @@ function entryCalls(t1) {
     ld_log_read: [logins.s1, [id, t1.epoch, 0]],
     ld_log_ack: [logins.s1, [id, t1.epoch, 0]],
     ld_set_principal: [logins.admin, [logins.a2, 'agent', 'a2', ['linux'], ['*'], 1]],
+    ld_set_repo_mode: [logins.admin, ['a2', 'open']],
     ld_reap: [logins.admin, []],
     ld_queue_ref: [logins.s1, []],
     ld_enqueue_fenced: [logins.s1, ['0.0', tid(8), 'repoA', 'test', 'lk8', { protocol: 1 }, { cmd: ['true'] }, snapshot, [], 1, 1000, 0]],
@@ -72,7 +73,7 @@ function entryCalls(t1) {
 const GUARDS = {
   'the timeline restore settles the queue from each ld_* function': async (w, makeWorld) => {
     const su = await w.su();
-    const { rows } = await su.query("SELECT proname FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace AND proname LIKE 'ld\\_%' ORDER BY proname");
+    const { rows } = await su.query("SELECT DISTINCT proname FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace AND proname LIKE 'ld\\_%' ORDER BY proname");
     const probe = entryCalls({ id: tid(1), epoch: 1, token: randomUUID() });
     assert.deepEqual(Object.keys(probe).sort(), rows.map((r) => r.proname).filter((n) => !NOT_ENTRY_CHECKED.includes(n)), 'every ld_* function is in the loop');
     for (const name of Object.keys(probe)) {

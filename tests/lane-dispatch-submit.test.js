@@ -100,13 +100,14 @@ const GUARDS = {
 
   'ld_placeable counts the agents eligible for the repo and tags': async (w) => {
     const [s1, admin] = [await w.as(logins.s1), await w.as(logins.admin)];
-    assert.equal(await call(s1, 'ld_placeable', 'repoA', []), 3, 'a1 (repoA), a2 and x (*) are eligible with no tags');
-    assert.equal(await call(s1, 'ld_placeable', 'repoB', []), 2, 'a1 does not allow repoB');
-    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['fast']), 1, 'only a1 has the fast tag');
-    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['gpu']), 0);
-    assert.equal(await call(s1, 'ld_placeable', 'repoA', null), 3);
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', [], 'repoA'), 3, 'a1 (repoA enforced), a2 and x (open) are eligible with no tags');
+    assert.equal(await call(s1, 'ld_placeable', 'repoB', [], 'repoB'), 2, 'a1 does not list repoB');
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['fast'], 'repoA'), 1, 'only a1 has the fast tag');
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['gpu'], 'repoA'), 0);
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', null, 'repoA'), 3);
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', []), 2, 'the 2-argument probe sends no name, so it scores the ticket as adhoc: a1 does not list adhoc');
     await call(admin, 'ld_set_principal', logins.x, 'agent', 'x', [], ['*'], 0);
-    assert.equal(await call(s1, 'ld_placeable', 'repoA', []), 2, 'a principal with max_claims 0 never counts');
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', [], 'repoA'), 2, 'a principal with max_claims 0 never counts');
   },
 
   'every agent principal carries host:<its host>, an admin cannot set another host: tag, and a ticket pinned to one host is claimable only by it': async (w) => {
@@ -130,7 +131,9 @@ const GUARDS = {
     assert.equal(detail.runners[0].host, 'a2');
     assert.ok(detail.runners[0].seenAgoS >= 0 && detail.runners[0].seenAgoS < 60);
     assert.deepEqual(await call(s1, 'ld_placeable_detail', 'repoA', ['host:nowhere']), { eligible: 0, runners: [] });
-    assert.equal((await call(s1, 'ld_placeable_detail', 'repoB', [])).eligible, 2, 'a1 does not allow repoB');
+    assert.equal((await call(s1, 'ld_placeable_detail', 'repoB', [])).eligible, 2, 'the 2-argument form scores adhoc, which a1 does not list');
+    assert.equal((await call(s1, 'ld_placeable_detail', 'k', ['host:a1'], 'repoA')).eligible, 1, 'a1 lists repoA');
+    assert.equal((await call(s1, 'ld_placeable_detail', 'k', ['host:a1'], 'repoB')).eligible, 0, 'a1 does not list repoB');
   },
 
   'ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises': async (w) => {
@@ -302,14 +305,14 @@ const CANARIES = [
     "coalesce(CASE WHEN jsonb_typeof(v_t.result->'cancelConfirmed') = 'boolean' THEN (v_t.result->>'cancelConfirmed')::boolean END, v_t.state = 'cancelled' AND v_t.result IS NULL)", "v_t.state = 'cancelled'"],
   ['ld_finish never stores an author key, so only the queue itself can write a queue-authored record', "(p_result - 'author') ||", 'p_result ||'],
   ['ld_cancel stores a server-authored result and a replay never upgrades confirmation', "'epoch', v_t.epoch, 'author', 'queue')", "'epoch', v_t.epoch)"],
-  ['ld_placeable counts the agents eligible for the repo and tags', ' AND lane_dispatch.eligible(coalesce(p_requires_tags, \'{}\'), p_repo_key, p.tags, p.allowed_repos));', ');'],
+  ['ld_placeable counts the agents eligible for the repo and tags', ' AND lane_dispatch.eligible(coalesce(p_requires_tags, \'{}\'), p_repo_name, p.tags, p.allowed_repos, p.repo_mode));', ');'],
   ['ld_placeable counts the agents eligible for the repo and tags', "p.kind = 'agent' AND p.max_claims > 0", "p.kind = 'agent'"],
   ['every agent principal carries host:<its host>, an admin cannot set another host: tag, and a ticket pinned to one host is claimable only by it',
     "|| ARRAY['host:' || NEW.host];", "|| '{}'::text[];"],
   ['every agent principal carries host:<its host>, an admin cannot set another host: tag, and a ticket pinned to one host is claimable only by it',
     "WHERE t NOT LIKE 'host:%'", 'WHERE true'],
   ['ld_placeable_detail names the runners that could claim a ticket and when each last polled the queue',
-    "WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos);", "WHERE p.kind = 'agent' AND p.max_claims > 0;"],
+    "\n     AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), coalesce(nullif(p_repo_name, ''), 'adhoc'), p.tags, p.allowed_repos, p.repo_mode);", ';'],
   ['ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises',
     'OR (p_after_finished IS NOT NULL AND p_after_id IS NOT NULL AND (t.finished_at, t.id) > (p_after_finished, p_after_id)))', 'OR true)'],
   ['ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises',

@@ -45,7 +45,7 @@ const CANARIES = [
   ['ld_claim offers a ticket that requires tools only to an agent naming all of them, and the older 4-argument claim never takes it', "'requires', t.requires, ", ''],
   ['ld_enqueue_fenced stores requires, and the old call shape stores none', 'p_avoid_tags, p_requires, p_min_cpu_cores);', 'p_avoid_tags, NULL, p_min_cpu_cores);'],
   ['ld_needed_tools lists the distinct, sorted tools of the queued tickets this agent is eligible for',
-    "WHERE t.state = 'queued' AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos));", "WHERE t.state = 'queued');"],
+    "WHERE t.state = 'queued' AND lane_dispatch.eligible(t.requires_tags, lane_dispatch.ticket_repo(t.header), v_me.tags, v_me.allowed_repos, v_mode));", "WHERE t.state = 'queued');"],
   ['ld_needed_tools lists the distinct, sorted tools of the queued tickets this agent is eligible for', "WHERE t.state = 'queued' AND lane_dispatch.eligible(", 'WHERE lane_dispatch.eligible('],
 ];
 
