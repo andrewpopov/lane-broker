@@ -82,7 +82,8 @@ const scenarios = {
         return tick.at - sinceMs;
       });
       const killTick = ticks.findLastIndex((tick) => tick.at <= killed.guardKillAt);
-      const firstEligible = silences.findIndex((silent) => silent >= silenceTimeoutMs - tickMs);
+      const killStretchStart = Math.max(0, ticks.findLastIndex((tick, i) => i > 0 && i <= killTick && tick.size > ticks[i - 1].size));
+      const firstEligible = silences.findIndex((silent, i) => i >= killStretchStart && silent >= silenceTimeoutMs - tickMs);
       assert.ok(silences[killTick] >= silenceTimeoutMs - tickMs, `killed after ${silences[killTick]} ms of observed silence, before the ${silenceTimeoutMs} ms window`);
       assert.ok(firstEligible !== -1 && killTick <= firstEligible + 1, `killed on guard tick ${killTick}, but tick ${firstEligible} had already been silent for ${silences[firstEligible]} ms of the ${silenceTimeoutMs} ms window`);
     } finally {
