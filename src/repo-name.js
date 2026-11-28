@@ -9,7 +9,8 @@ export const MAX_LOCAL_HOPS = 3;
 
 const SEGMENT = /^[a-z0-9][a-z0-9._-]*$/;
 const SCHEME_URL = /^[a-z][a-z0-9+.-]*:\/\//i;
-const SCP_URL = /^(?:[^@/\s]+@)?[^:/\s]+:(?!\/\/)(.+)$/;
+const SCP_URL = /^(?:[^@/\s]+@)?(?:\[[0-9a-f:.]+\]|[^:/\s]+):(?!\/\/)(.+)$/i;
+const DRIVE_PATH = /^[a-z]:[\\/]/i;
 const REMOTE_SCHEMES = new Set(['ssh:', 'https:', 'http:', 'git:', 'git+ssh:', 'ssh+git:']);
 
 const slugOfPath = (urlPath) => {
@@ -22,15 +23,15 @@ const slugOfPath = (urlPath) => {
 /** `{ slug }` for a remote URL, `{ localPath }` for a path on this machine, `null` for anything else. */
 function classify(originUrl) {
   if (SCHEME_URL.test(originUrl)) {
-    let url;
     try {
-      url = new URL(originUrl);
+      const url = new URL(originUrl);
+      if (url.protocol === 'file:') return { localPath: fileURLToPath(url) };
+      return REMOTE_SCHEMES.has(url.protocol) ? { slug: slugOfPath(decodeURIComponent(url.pathname)) } : null;
     } catch {
       return null;
     }
-    if (url.protocol === 'file:') return { localPath: fileURLToPath(url) };
-    return REMOTE_SCHEMES.has(url.protocol) ? { slug: slugOfPath(decodeURIComponent(url.pathname)) } : null;
   }
+  if (DRIVE_PATH.test(originUrl)) return { localPath: originUrl };
   const scp = SCP_URL.exec(originUrl);
   if (scp && !originUrl.startsWith('/') && !originUrl.startsWith('.')) return { slug: slugOfPath(scp[1]) };
   return { localPath: originUrl };
@@ -60,8 +61,11 @@ export function repoName(originUrl, { readOrigin = originUrlOf, baseDir = proces
     if (found === null) return ADHOC_REPO;
     if (found.slug !== undefined) return found.slug ?? ADHOC_REPO;
     if (hops === MAX_LOCAL_HOPS) return ADHOC_REPO;
-    base = path.resolve(base, found.localPath);
-    if (!fs.existsSync(base)) return ADHOC_REPO;
+    try {
+      base = fs.realpathSync(path.resolve(base, found.localPath));
+    } catch {
+      return ADHOC_REPO;
+    }
     current = readOrigin(base)?.trim() ?? '';
   }
   return ADHOC_REPO;

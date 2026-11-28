@@ -23,6 +23,8 @@ const URL_FORMS = [
   ['upper case', 'git@github.com:PopovLabs/TowerPower.GIT', 'popovlabs/towerpower'],
   ['a fork keeps its own owner', 'https://github.com/andrewpopov/towerpower.git', 'andrewpopov/towerpower'],
   ['nested groups keep the last two segments', 'https://gitlab.example/group/sub/proj.git', 'sub/proj'],
+  ['a bracketed IPv6 scp host', 'git@[2001:db8::1]:Owner/Repo.git', 'owner/repo'],
+  ['a bracketed IPv6 scp host with no user', '[::1]:owner/repo.git', 'owner/repo'],
   ['a slug no runner lists is still the slug, never adhoc', 'https://github.com/nobody/never-heard-of-it.git', 'nobody/never-heard-of-it'],
 ];
 
@@ -36,6 +38,10 @@ const ADHOC_FORMS = [
   ['an unknown scheme', 'ftp://example.com/a/b.git'],
   ['a segment that is not a slug', 'https://github.com/a b/c.git'],
   ['a local path that does not exist', '/no/such/dir/anywhere'],
+  ['a file:// url with a host, which is no path on this machine', 'file://server/share/repo.git'],
+  ['a malformed percent escape', 'ssh://host/owner/100%done.git'],
+  ['a Windows drive path with forward slashes', 'C:/repos/cache.git'],
+  ['a Windows drive path with backslashes', 'C:\\repos\\cache.git'],
 ];
 
 const NAMING_SCENARIO = async (load) => {
@@ -118,4 +124,40 @@ const STAMP_SCENARIO = async (load) => {
 test('the submitter stamp carries the name and this package\'s version', async () => {
   await STAMP_SCENARIO(realSrc);
   await assertCanaryFails('repo-name.js', ['brokerVersion: BROKER_VERSION }', '}'], STAMP_SCENARIO);
+});
+
+const ALIAS_SCENARIO = (t) => async (load) => {
+  const { repoName } = await load('repo-name.js');
+  const dir = fs.realpathSync(makeTmpDir('repo-name-alias-', t));
+  const [a, b] = ['a', 'b'].map((name) => path.join(dir, 'repos', name));
+  for (const repo of [a, b]) {
+    fs.mkdirSync(repo, { recursive: true });
+    gitFixture(['init', '-q'], repo);
+  }
+  gitFixture(['remote', 'add', 'origin', '../b'], a);
+  gitFixture(['remote', 'add', 'origin', GIT_ORIGIN], b);
+  fs.mkdirSync(path.join(dir, 'aliases'));
+  fs.symlinkSync(a, path.join(dir, 'aliases', 'a'));
+  assert.equal(repoName(path.join(dir, 'aliases', 'a')), 'popovlabs/towerpower', 'a relative origin resolves against the real directory, not the symlink');
+};
+
+test('a symlinked local origin resolves its relative origin against the link target', async (t) => {
+  await ALIAS_SCENARIO(t)(realSrc);
+  await assertCanaryFails('repo-name.js', ['base = fs.realpathSync(path.resolve(base, found.localPath));', 'base = path.resolve(base, found.localPath);'], ALIAS_SCENARIO(t));
+});
+
+test('the url forms that used to throw, split wrongly or misread are caught by their own guards', async () => {
+  const scenario = async (load) => {
+    const { repoName } = await load('repo-name.js');
+    for (const origin of ['file://server/share/repo.git', 'ssh://host/owner/100%done.git']) assert.equal(repoName(origin), 'adhoc', origin);
+    for (const origin of ['C:/repos/cache.git', 'C:\\repos\\cache.git']) assert.equal(repoName(origin), 'adhoc', origin);
+    assert.equal(repoName('git@[2001:db8::1]:Owner/Repo.git'), 'owner/repo');
+  };
+  await scenario(realSrc);
+  await assertCanaryFails('repo-name.js', [
+    ['    try {\n      const url = new URL(originUrl);', '    if (true) {\n      const url = new URL(originUrl);'],
+    ['    } catch {\n      return null;\n    }\n  }\n  if (DRIVE_PATH', '    }\n  }\n  if (DRIVE_PATH'],
+  ], scenario, /URI malformed|file URL|must be/i);
+  await assertCanaryFails('repo-name.js', ['  if (DRIVE_PATH.test(originUrl)) return { localPath: originUrl };\n', ''], scenario);
+  await assertCanaryFails('repo-name.js', ['(?:\\[[0-9a-f:.]+\\]|[^:/\\s]+)', '[^:/\\s]+'], scenario);
 });
