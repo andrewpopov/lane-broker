@@ -1,10 +1,22 @@
+import path from 'node:path';
 import { readAttempt, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
-import { readEnvelope, withTicketLock } from './pull-envelope.js';
+import { DISPATCH_KEY_REFUSED_EXIT, dispatchKeyRefusal } from './dispatch-key.js';
+import { pullTicketDir, readEnvelope, withTicketLock } from './pull-envelope.js';
+import { atomicWriteJson, readJsonSafe } from './state.js';
 
 export const STALE_QUEUE_REF = 'stale-queue-ref';
 export const ENQUEUE_CROSSED_RESTORE = 'enqueue-crossed-restore';
 export const ENQUEUE_PAST_RETENTION = 'enqueue-past-retention';
+
+export const DISPATCH_KEY_REFUSED = 'dispatch-key-refused';
+export const DISPATCH_KEY_REFUSED_REASON = 'dispatch-key-refused';
+
+export const enqueueAckFile = (root, id) => path.join(pullTicketDir(root, id), 'ack.json');
+
+/** The ticket id the queue chose for a keyed submission (its own, or the one the key already named), made durable before anything can be published and the attempt removed. */
+const writeEnqueueAck = (root, id, view) => atomicWriteJson(enqueueAckFile(root, id), { ticketId: view.id, state: view.state ?? null, host: view.host ?? null }, { fsync: true });
+const readEnqueueAck = (root, id) => readJsonSafe(enqueueAckFile(root, id));
 
 const EMPTY_INTENT = { attempts: [], seenRowAt: null };
 
@@ -26,6 +38,7 @@ export function enqueueArgs(envelope) {
     memoryBytes: envelope.memoryBytes,
     priority: envelope.priority,
     ...(envelope.minProtocol === undefined ? {} : { minProtocol: envelope.minProtocol }),
+    ...(envelope.dispatchKey === undefined ? {} : { dispatchKey: envelope.dispatchKey }),
   };
 }
 
@@ -57,6 +70,15 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
     const args = enqueueArgs(readEnvelope(root, id));
     const intent = intentOf(readAttempt(root, id));
     if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };
+    // the queue already refused this submission for good: it is decided again from the record, never sent again
+    if (intent.refusal !== undefined) {
+      // the ack the parent reads is rebuilt from the durable refusal if it was lost with the crash
+      if (intent.refusal.ticketId && readEnqueueAck(root, id) === null) writeEnqueueAck(root, id, { id: intent.refusal.ticketId, state: intent.refusal.holderState, host: intent.refusal.holderHost });
+      return { outcome: DISPATCH_KEY_REFUSED, ...intent.refusal };
+    }
+    // an ack naming another ticket is that same refusal, made durable before the intent could record it: the winner may have been withdrawn since, and this command must not take its place
+    const acked = readEnqueueAck(root, id);
+    if (acked?.ticketId && acked.ticketId !== id) return { outcome: DISPATCH_KEY_REFUSED, reason: `dispatch key ${args.dispatchKey} is already ticket ${acked.ticketId}; resubmit to adopt it`, exitCode: DISPATCH_KEY_REFUSED_EXIT, ticketId: acked.ticketId };
     if (crossedRestore(intent.attempts)) return { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE };
     if (pastRetention(intent.attempts, now(), rowRetentionMs)) return { outcome: 'lost', reason: ENQUEUE_PAST_RETENTION };
     // nothing has been sent, so a cancel that has arrived ends the ticket here and no row is ever created; checked under the lock, before the intent is recorded
@@ -70,8 +92,34 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
       return { ...current, attempts: [...current.attempts, sending] };
     });
 
-    const view = await queue.enqueueFenced({ expectRef: ref, ...args });
+    // `ticketId` (the ticket the key already names) is kept on the intent so a detached caller can print it
+    const refuse = async (refusal) => {
+      await persistIntent({ root, id, generation }, (current) => ({ ...current, refusal, ...(refusal.ticketId === undefined ? {} : { heldTicketId: refusal.ticketId }), attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: 'refused' } : attempt)) }));
+      return { outcome: DISPATCH_KEY_REFUSED, ...refusal };
+    };
+    let view;
+    try {
+      view = await queue.enqueueFenced({ expectRef: ref, ...args });
+    } catch (err) {
+      const refusal = args.dispatchKey === undefined ? null : dispatchKeyRefusal(err);
+      if (refusal === null) throw err;
+      return refuse(refusal);
+    }
+    // the key already names another of this owner's tickets (a concurrent or earlier submit): nothing was inserted, and this id must not shadow that ticket
+    if (args.dispatchKey !== undefined && view.id !== undefined && view.id !== id) {
+      // a holder that was withdrawn between the queue's lookup and its view holds nothing: no id is offered for it
+      if (view.state === 'withdrawn') return refuse({ reason: `dispatch key ${args.dispatchKey} was held by ticket ${view.id}, which was withdrawn; resubmit`, exitCode: DISPATCH_KEY_REFUSED_EXIT });
+      // the refusal is recorded first, then the winner is told: a crash between the two leaves the ack, which recovery reads as the same refusal
+      const refused = await refuse({ reason: `dispatch key ${args.dispatchKey} is already ticket ${view.id}; resubmit to adopt it`, exitCode: DISPATCH_KEY_REFUSED_EXIT, ticketId: view.id, holderState: view.state ?? null, holderHost: view.host ?? null });
+      writeEnqueueAck(root, id, view);
+      return refused;
+    }
+    // a replay of a keyed enqueue whose row was withdrawn meanwhile is answered with that withdrawn row: not a queued ticket, so it is refused
+    if (args.dispatchKey !== undefined && view.state === 'withdrawn') {
+      return refuse({ reason: `dispatch key ${args.dispatchKey} names a withdrawn ticket; resubmit with a new key`, exitCode: DISPATCH_KEY_REFUSED_EXIT });
+    }
     const stale = view.state === STALE_QUEUE_REF;
+    if (args.dispatchKey !== undefined && !stale) writeEnqueueAck(root, id, view);
     const settled = await persistIntent({ root, id, generation }, (current) => ({
       attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: stale ? 'stale' : 'row' } : attempt)),
       seenRowAt: stale ? null : new Date(now()).toISOString(),

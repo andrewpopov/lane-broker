@@ -8,6 +8,9 @@ import { recordSettledResult, relayedPhases } from './supervisor.js';
 // exactly what `historyRow` and `settledContentKey` read from the ticket, so a result published by anyone lands as the supervisor's would
 const ENRICHED_FIELDS = ['id', 'key', 'repoId', 'lane', 'configLane', 'configFrom', 'configBlob', 'localFirst', 'exclusive', 'weight', 'resources', 'declaredCpuCores', 'command', 'cmdFingerprint', 'headTree', 'contentKey', 'contentKeyTags', 'retryReason', 'pushGate', 'localReason', 'localReasonText', 'cwd'];
 
+/** The exit a proven never-started ticket is refused with, whoever publishes it: 76 where the host only dispatches or the submission is keyed (the key finds the run again, so retrying is right), else the lost exit. */
+export const refusalExitOf = ({ dispatchOnly, dispatchKey }, noRunnerExit) => (dispatchOnly || dispatchKey ? noRunnerExit : undefined);
+
 export function publicationOf(enriched, { placement, attemptStartedAt, refusalExit }) {
   return {
     logPath: enriched.logPath,

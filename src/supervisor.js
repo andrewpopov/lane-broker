@@ -50,7 +50,9 @@ import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforceme
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { placeForPull, isPinnedToHost } from './pull-placement.js';
-import { publicationBindings, publicationOf } from './pull-publication.js';
+import { dispatchKeyPullRefusal } from './dispatch-key.js';
+import { DISPATCH_KEY_REFUSED_REASON } from './pull-enqueue.js';
+import { publicationBindings, publicationOf, refusalExitOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
 import { withRepoIdentity } from './pull-snapshot.js';
 import { assertWithdrawCommitted, PrepareAbandoned, PULL_UNREACHABLE_REASON, preparePullTicketWithRetry, proveNeverEnqueued, pullExitCode, runPullTicket, sleepUnlessAborted, withdrawQueued as withdrawPullQueued } from './pull-ticket.js';
@@ -1115,6 +1117,15 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner, failureKind } = {}) {
     assertPullFallbackAllowed();
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
+    // PKG-438: a keyed submission is found again by its key in the pull queue, so it never runs anywhere else. Its refusal is published from the attempt as it
+    // is, never after the move to local: a supervisor that died in between would leave an abandoned local attempt, which recovery publishes as 75.
+    if (enriched.dispatchKey) {
+      const refusal = dispatchKeyPullRefusal(enriched.lane, reason);
+      process.stderr.write(refusal.message);
+      await testHoldAt('keyed-refusal');
+      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));
+      return { fallback: false };
+    }
     const fb = movedByPullFallback ? { ok: true, attempt: readAttempt(root, enriched.id) } : await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
@@ -1314,11 +1325,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
     }), worktreeRoot);
-    const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: isDispatchOnly(globalCfg) ? NO_RUNNER_EXIT_CODE : undefined });
+    const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: refusalExitOf({ dispatchOnly: isDispatchOnly(globalCfg), dispatchKey: enriched.dispatchKey }, NO_RUNNER_EXIT_CODE) });
     const ctx = {
       ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
       ...publicationBindings(root, publication),
-      localFallback: { enabled: pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
+      localFallback: { enabled: !enriched.dispatchKey && pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
       prepare: {
         worktreeRoot,
         manifest,
@@ -1328,6 +1339,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           repoKey: enriched.remote.repoKey,
           lane: enriched.lane,
           laneKey: enriched.key,
+          ...(enriched.dispatchKey ? { dispatchKey: enriched.dispatchKey } : {}),
           cpuCores: enriched.remote.cpuCores,
           ...(enriched.remote.minCpuCores !== undefined ? { minCpuCores: enriched.remote.minCpuCores } : {}),
           memoryBytes: enriched.remote.memoryBytes ?? 0,
@@ -1353,6 +1365,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     }
     const outcome = await runPullTicket({ ...ctx, prepare: undefined });
     const exitCode = pullExitCode(outcome);
+    // a keyed enqueue the queue refused inserted nothing: it settled as a published decision, whose reason is the caller's explanation
+    if (outcome.decision?.reason === DISPATCH_KEY_REFUSED_REASON) process.stderr.write(`lane run: ${outcome.decision.detail}\n`);
     if (outcome.outcome === 'unresolved') return exitUnresolved(`pull dispatch unresolved: ${outcome.reason}${outcome.error ? ` (${outcome.error})` : ''}`, exitCode);
     if (exitCode !== undefined) return exitSettled(exitCode);
     if (outcome.outcome === 'local-fallback') {
@@ -1404,6 +1418,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       process.stderr.write(line);
       writeBrokerLog(root, line);
     }
+    // a keyed ticket that is not queued for pull (a push runner, local, legacy) would run where its key cannot find it
+    if (enriched.dispatchKey && route.route !== 'pull') return fallbackOrRefuse(null, route.reason ?? `route ${route.route}`, { noRunner: true });
     if (route.route === 'refuse') return fallbackOrRefuse(null, `${skippedSummary()}; ${route.reason}`, { rebindable: true, noRunner: true, retryable: true });
     if (route.route === 'local') return fallbackOrRefuse(null, `${skippedSummary()}; local can run it now, not queuing for pull`, { rebindable: true });
     if (route.route === 'pull') return dispatchViaPull(route.services, skippedSummary());
