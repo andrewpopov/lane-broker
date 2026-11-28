@@ -42,8 +42,8 @@ export class World {
     await applyDatabaseAcls(su);
     const admin = await world.as(logins.admin);
     await call(admin, 'ld_set_principal', logins.a1, 'agent', 'a1', ['linux', 'fast'], ['repoA'], 2);
-    await call(admin, 'ld_set_principal', logins.a2, 'agent', 'a2', ['linux'], ['*'], 1);
-    await call(admin, 'ld_set_principal', logins.x, 'agent', 'x', [], ['*'], 1);
+    await call(admin, 'ld_set_principal', logins.a2, 'agent', 'a2', ['linux'], ['*'], 1, 'open');
+    await call(admin, 'ld_set_principal', logins.x, 'agent', 'x', [], ['*'], 1, 'open');
     await call(admin, 'ld_set_principal', logins.s1, 'submit', null, [], [], 1);
     await call(admin, 'ld_set_principal', logins.s2, 'submit', null, [], [], 1);
     for (const login of [logins.a1, logins.a2, logins.x]) await call(await world.as(login), 'ld_register', 'test', 1, null);
@@ -72,8 +72,8 @@ export async function call(client, name, ...args) {
 
 export const tid = gid;
 
-export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [], requires = [], minCpu, weight } = {}) =>
-  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'], ...(weight === undefined ? {} : { weight }) }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags, requires,
+export const enqueue = (client, id, { repo = 'repoA', repoName = repo, laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [], requires = [], minCpu, weight } = {}) =>
+  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'], ...(repoName === null ? {} : { repoName }), ...(weight === undefined ? {} : { weight }) }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags, requires,
     ...(minCpu === undefined ? [] : [minCpu]));
 
 /** `capacity` (the runner's whole CPU budget, BRAIN-1099) and `freeWeight` with `weightLimit` (BRAIN-1106) are sent only when given, so the default call carries neither, as an older agent's does. */
@@ -84,6 +84,11 @@ export const finish = (client, claimed, result = { kind: 'ok', exitCode: 0 }) =>
 export const start = (client, claimed) => call(client, 'ld_start', claimed.id, claimed.epoch, claimed.token);
 export const heartbeat = (client, claimed) => call(client, 'ld_heartbeat', claimed.id, claimed.epoch, claimed.token);
 export const release = (client, claimed, proof = 'never-started') => call(client, 'ld_release', claimed.id, claimed.epoch, claimed.token, proof);
+
+/** Real-client tickets carry no header.repoName until S3, so they are adhoc; a runner that must claim them is put in open mode (a superuser write, which the guard trigger passes), leaving a1 restricted everywhere else. */
+export async function openRepoMode(world, login) {
+  await (await world.su()).query("UPDATE lane_dispatch.principals SET repo_mode = 'open' WHERE login_role = $1", [login]);
+}
 
 /** A requeue backs the ticket off (5 s and up); a test that claims it again straight away lifts the backoff first. */
 export async function liftBackoff(world) {
@@ -129,8 +134,22 @@ export async function downgradeToV8(world) {
   await su.query('DROP FUNCTION lane_dispatch.claim_need(real, real, interval, interval)');
 }
 
+/** Puts the world's queue back to schema version 12 (origin/main's functions.sql before 013): no repo_mode, no guard trigger, no audit view, no 013 function signatures. */
+export async function downgradeToV12(world) {
+  const su = await world.su();
+  await su.query('DROP VIEW lane.pull_repo_audit, lane.pull_principals');
+  await su.query('DROP TRIGGER principals_repo_guard ON lane_dispatch.principals');
+  await su.query('DROP FUNCTION lane_dispatch.principals_repo_guard(), lane_dispatch.ticket_repo(jsonb), lane_dispatch.eligible(text[], text, text[], text[], text), lane_dispatch.scarcity(text[], text)');
+  await su.query('DROP FUNCTION lane_dispatch.ld_placeable(text, text[], text), lane_dispatch.ld_placeable_detail(text, text[], text), lane_dispatch.ld_set_principal(text, text, text, text[], text[], int, text), lane_dispatch.ld_set_repo_mode(text, text)');
+  await su.query('DROP INDEX lane_dispatch.tickets_terminal_recent');
+  await su.query('ALTER TABLE lane_dispatch.principals DROP COLUMN repo_mode');
+  await su.query('DELETE FROM lane.schema_version WHERE version = 13');
+  await su.query(fs.readFileSync(new URL('./fixtures/lane-v12-functions.sql', import.meta.url), 'utf8'));
+}
+
 /** Puts the world's queue back to schema version 9 (the 9e7487f functions.sql, BRAIN-1099): no 010 function signatures. */
 export async function downgradeToV9(world) {
+  await downgradeToV12(world);
   const su = await world.su();
   await su.query('DELETE FROM lane.schema_version WHERE version = 10');
   await su.query('DROP FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint, real, real)');

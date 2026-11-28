@@ -1,6 +1,6 @@
 import { LdClient as RealLdClient } from '../src/agent/ld-client.js';
 import { randomUUID } from 'node:crypto';
-import { logins, call, enqueue, tid } from './lane-dispatch-fixture.js';
+import { logins, call, enqueue, openRepoMode, tid } from './lane-dispatch-fixture.js';
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -15,6 +15,7 @@ export const closeAgents = async () => {
 export const agentPg = (w, login = logins.a1) => ({ ...w.cluster.conn(w.db, login), options: '-c statement_timeout=0' });
 
 export async function openAgent(w, { login = logins.a1, open = true, LdClient = RealLdClient, ...rest } = {}) {
+  await openRepoMode(w, login);
   const calls = [];
   const events = [];
   const client = new LdClient({

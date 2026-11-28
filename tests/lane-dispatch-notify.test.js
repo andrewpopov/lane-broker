@@ -82,9 +82,9 @@ const GUARDS = {
   'ld_set_principal refuses a host that is not a safe channel name': async (w) => {
     const admin = await w.as(logins.admin);
     for (const host of ['Bad_Host', '-x', 'a1; DROP', '', 'a'.repeat(56), 'a.b', 'a_1']) {
-      await assert.rejects(call(admin, 'ld_set_principal', logins.a1, 'agent', host, [], ['*'], 1), /not a valid channel name/, `host ${JSON.stringify(host)}`);
+      await assert.rejects(call(admin, 'ld_set_principal', logins.a1, 'agent', host, [], ['repoA'], 1), /not a valid channel name/, `host ${JSON.stringify(host)}`);
     }
-    for (const host of ['workbook-pro', 'mac-mbp2', 'a'.repeat(55), '1']) await call(admin, 'ld_set_principal', logins.a1, 'agent', host, [], ['*'], 1);
+    for (const host of ['workbook-pro', 'mac-mbp2', 'a'.repeat(55), '1']) await call(admin, 'ld_set_principal', logins.a1, 'agent', host, [], ['repoA'], 1);
   },
 };
 

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { call, claim, finish, heartbeat, liftBackoff, logins, release, start } from '../lane-dispatch-fixture.js';
+import { call, claim, finish, heartbeat, liftBackoff, logins, openRepoMode, release, start } from '../lane-dispatch-fixture.js';
 import { sha256Hex } from '../../src/s3-presign.js';
 
 // Learns its host from the queue at registration, as an agent does, and derives its output keys the way a real runner does (`<host>/<ticket>/e<epoch>/<name>` in `lane-out`) and PUTs with its own signed request, so a wrong host, epoch or signature fails at the S3 stub
@@ -15,6 +15,7 @@ export class StubRunner {
   }
 
   async claim(options) {
+    await openRepoMode(this.world, this.login);
     await liftBackoff(this.world);
     this.host = (await call(await this.client(), 'ld_register', 'test', 1, null)).host;
     const claimed = await claim(await this.client(), options);

@@ -168,7 +168,7 @@ const SEMANTICS = {
     const su = await w.su();
     const { rows: [{ ttl }] } = await su.query('SELECT extract(epoch FROM lease_until - now()) AS ttl FROM lane_dispatch.tickets');
     assert.ok(ttl > 110 && ttl <= 120, `lease ${ttl}`);
-    assert.deepEqual([got.snapshot, got.header, got.binding], [{ key: 'snap', sha256: 'x' }, { cmd: ['true'] }, { protocol: 1 }]);
+    assert.deepEqual([got.snapshot, got.header, got.binding], [{ key: 'snap', sha256: 'x' }, { cmd: ['true'], repoName: 'repoA' }, { protocol: 1 }]);
   },
 
   'a claim takes the highest priority, then the oldest, and only what fits the runner free cpu, memory and held keys': async (w) => {
@@ -239,7 +239,7 @@ const SEMANTICS = {
 const CANARIES = [
   ['ld_claim refuses past max_claims', 'IF v_held >= v_me.max_claims THEN', 'IF false THEN'],
   ['ld_claim never hands out a ticket whose requires_tags the principal lacks', 'p_requires_tags <@ p_tags AND ', ''],
-  ['ld_claim never hands out a ticket outside the principal allowed_repos', " AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos))", ''],
+  ['ld_claim never hands out a ticket outside the principal allowed_repos', "p_repo_mode <> 'enforce' OR (p_repo_name = ANY (p_allowed_repos)) IS TRUE", 'true'],
   ['ld_start refuses a ticket with cancel_requested', 'IF v_t.cancel_requested THEN RETURN false; END IF;', ''],
   ['ld_start refuses a running row whose cancel was requested', 'RETURN NOT v_t.cancel_requested;', 'RETURN true;'],
   ['ld_start refuses an expired lease', 'IF v_t.lease_until <= lane_dispatch.now() THEN RETURN false; END IF;', ''],

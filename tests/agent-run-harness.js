@@ -10,7 +10,7 @@ import { makeTmpDir } from './helpers/tmp.js';
 import { startS3Stub, STUB_CREDS, STUB_REGION } from './helpers/s3-stub.js';
 import { setupRunner, makeHeader } from './helpers/remote-exec-fixture.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
-import { World, call, logins, startDispatchCluster } from './lane-dispatch-fixture.js';
+import { World, call, logins, openRepoMode, startDispatchCluster } from './lane-dispatch-fixture.js';
 import { agentPg, closeAgents } from './agent-harness.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { encodeSnapshot } from '../src/remote-stream.js';
@@ -62,6 +62,7 @@ export class RunnerWorld {
     const ctx = setupRunner({}, { remoteBlobCache: true, ...runnerConfig });
     const s3 = await startS3Stub();
     s3.objects.set('lane-snap/.probe', { body: Buffer.from('probe'), lastModified: Date.now() });
+    await openRepoMode(w, logins.a1);
     const world = new RunnerWorld(w, ctx, s3);
     world.saved = { state: process.env.LANE_BROKER_STATE, home: process.env.LANE_BROKER_HOME };
     process.env.LANE_BROKER_STATE = ctx.state;
