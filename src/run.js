@@ -9,7 +9,7 @@ import { ensureStateDirs, writeReleasedMarkerFile, withLock, paths, stateHome, r
 import { classTransportMismatch } from './classes.js';
 import { remoteExcludePreflight } from './remote-exclude.js';
 import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
-import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError, CONFIG_FROM_ENV } from './config.js';
+import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError, CONFIG_FROM_ENV, deadlineProblem, resolveDeadline } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
@@ -294,6 +294,8 @@ export async function runCommand({
   memoryOverride,
   noProgressTimeoutOverride,
   silenceTimeoutOverride,
+  // BRAIN-940: `--deadline` (raw text, validated here); the lane's `deadlineMs` and the global are the other ways in
+  deadline: deadlineOverride,
   // BRAIN-403: `--exclusive`; the lane config's `exclusive` is the other way in
   exclusive: exclusiveOverride,
   // BRAIN-695: `--exclusive-purpose` / `--exclusive-deadline` (raw text, validated here); the lane config's keys are the other way in
@@ -436,6 +438,20 @@ export async function runCommand({
       if (exclusiveDeadlineMs !== null) return refuse(`lane "${resolved.lane}": exclusiveDeadlineMs is set but the run is not exclusive; it applies only to an exclusive run`);
     }
   }
+  let cliDeadlineMs = null;
+  if (deadlineOverride !== undefined) {
+    try {
+      cliDeadlineMs = parseDuration(deadlineOverride);
+    } catch (err) {
+      process.stderr.write(`lane run: --deadline: ${err.message}\n`);
+      return { exitCode: 64 };
+    }
+    const problem = deadlineProblem(cliDeadlineMs);
+    if (problem) {
+      process.stderr.write(`lane run: --deadline ${problem}\n`);
+      return { exitCode: 64 };
+    }
+  }
   // BRAIN-380: resolved and validated before the reentrancy check below, so a bad value exits 64 on every path.
   let priority;
   try {
@@ -564,6 +580,10 @@ export async function runCommand({
     const root = ensureStateDirs().root;
     const inheritedLeaseRecord = readLease(root, inheritedLease);
     if (inheritedLeaseRecord) {
+      if (cliDeadlineMs !== null) {
+        process.stderr.write('lane run: --deadline is refused on a run inside a lease (the enclosing run owns the deadline)\n');
+        return { exitCode: 64 };
+      }
       const inheritedRepoId = inheritedKey && inheritedKey.includes(':') ? inheritedKey.slice(0, inheritedKey.indexOf(':')) : null;
       const sameKey = inheritedKey === resolved.key;
       // BRAIN-403: an exclusive nested under another lane would wait on its own parent forever, and one nested under
@@ -810,6 +830,7 @@ export async function runCommand({
     // BRAIN-431: a remote runner's value is the submitter's own resolved one, never this host's config
     noProgressTimeoutMs: noProgressTimeoutOverride ?? resolved.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
     silenceTimeoutMs: silenceTimeoutOverride ?? resolved.silenceTimeoutMs ?? globalCfg.silenceTimeoutMs,
+    ...resolveDeadline({ cli: cliDeadlineMs, lane: resolved.deadlineMs, global: globalCfg.deadlineMs }),
     maxConcurrent: resolved.maxConcurrent,
     class: resolved.class,
     aging: resolved.aging,

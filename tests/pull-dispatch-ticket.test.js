@@ -35,6 +35,7 @@ const ticketOf = (fx) => ({ id: fx.id, key: 'repoA:test', repoId: 'repoA', lane:
 const historyRows = (fx) => fs.readFileSync(paths(fx.state).history, 'utf8').split('\n').filter((line) => line.includes(`"id":"${fx.id}"`));
 const withHistory = (fx) => ({ writeResult: (result, opts) => recordSettledResult(fx.state, ticketOf(fx), result, opts) });
 
+const RUN_LIMIT_RELAY = 'a run-limit kill the runner finished with settles the ticket with its reason and window, not a bare exit 124';
 const SCENARIOS = {
   'a queued pull ticket nobody claims is withdrawn once its timeout passes: the queue holds withdrawn and the attempt holds the proof': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
@@ -183,6 +184,15 @@ const SCENARIOS = {
     assert.equal(historyRows(fx).length, 1, 'the rebuild counted the ticket a second time');
   },
 
+  [RUN_LIMIT_RELAY]: async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await fx.runner.finish({ exit: 124, reason: 'run-limit', runLimitMs: 21_600_000, guard: 'run-limit', stopProven: true, ...(await fx.runner.putOutputs({ log: 'out\n' })) });
+    assert.equal((await fx.step()).state, 'settled');
+    const result = fx.published();
+    assert.deepEqual([result.exit, result.reason, result.runLimitMs, result.guard, result.stopProven], [124, 'run-limit', 21_600_000, 'run-limit', true]);
+  },
+
   'an attempt another publisher settled first ends the supervisor with that result\'s exit, not a crash': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
     await fx.hold();
@@ -216,6 +226,7 @@ const CANARIES = [
   ['a claimed ticket is never offered to the withdraw by the timeout, however old it is', 'pull-ticket.js', ["  switch (row.state) {\n    case 'queued':", "  if (queuedTooLong(run, attempt)) return expireQueued(run, attempt);\n  switch (row.state) {\n    case 'queued':"]],
   ['a result rebuilt from the ledger replaces the lost file without a second history row', 'pull-ticket.js', ['resultWriterOf(run)(result, { fsync: true, rebuilt: true });', 'resultWriterOf(run)(result, { fsync: true });']],
   ['an attempt another publisher settled first ends the supervisor with that result\'s exit, not a crash', 'pull-ticket.js', ["    if (step.state === 'settled' && step.decision === undefined) return settledElsewhere(ctx);\n", ''], /reading 'kind'/],
+  [RUN_LIMIT_RELAY, 'pull-ticket.js', ['...relayedSettlement(entry.result), ', '']],
 ];
 
 definePullSuite('pull dispatch: queued timeout, rebuilt results and foreign publishers', SCENARIOS, CANARIES);

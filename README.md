@@ -113,6 +113,7 @@ features like pipes or globbing.
 | `--exclusive-purpose upgrade\|calibration` | BRAIN-695: why the run needs the whole host. Config key `exclusivePurpose`. Without `--exclusive` it exits `64`. |
 | `--exclusive-deadline <dur>` | BRAIN-695: the hard limit on an exclusive run, from 60000 ms to 2 h: an integer in ms, or `30s`, `20m`, `2h`. Config key `exclusiveDeadlineMs` (integer ms). Without `--exclusive` it exits `64`. Not `--timeout`, which only stops *waiting* (exit `75`). |
 | `--tag <tag>` (repeatable), `--runner <name>` | PKG-468: tags this one ticket requires of a runner, added to the lane's `requiresTags`; `--runner x` is `--tag host:x`. See "Pinning a run to a runner" below. Needs a remote-eligible lane (exit `64` otherwise); no online runner can claim it: exit `76` with `waiting: no online runner has [host:x]`. |
+| `--deadline <dur>` | BRAIN-940: this run's wall-clock deadline, from 60000 ms to 24 h: `90s`, `20m`, `6h`; a bare number means seconds, as for `--timeout`. Beats the lane's `deadlineMs` and the global one (see "Run deadline" below). Out of range or not a duration exits `64`; so does a run inside an inherited lease (a reentrant or nested run), where the enclosing run owns the deadline. |
 | `--no-cache` | BRAIN-549: run even if the same command already passed on identical content (env `LANE_BROKER_NO_CACHE=1` does the same). See "Result cache" below. |
 | `--no-reuse` | BRAIN-700: answer nothing from history: neither a cached pass nor a known-red refusal. Advertised as capability `reuse-green/1`. See "Known-red refusal" below. |
 | `--retry "<why>"` | BRAIN-700: re-run content that already failed (env `LANE_BROKER_RETRY_REASON`; the flag wins; blank is usage exit `2`). Also bypasses serving a pass. The reason is recorded on the history row as `retryReason`. |
@@ -3114,6 +3115,21 @@ Do not opt in a lane that builds images, downloads, or buffers its output until 
 the watchdog cannot tell. Pick `noProgressTimeoutMs` for a hang that goes idle (no output, no CPU); pick
 `silenceTimeoutMs` for a streaming lane (e2e, verify) that can hang while still burning CPU, with a window well above its
 longest legitimate quiet stretch. A lane may set both.
+
+#### Run deadline (BRAIN-940)
+
+Every run has a wall-clock deadline. In this release (R1) it is carried and validated but **nothing enforces it**: no timer starts and no run is killed by it; the kill arrives in a later release.
+
+| Setting | Where | Default | Meaning |
+|---|---|---|---|
+| `deadlineMs` | global `config.json` | `21600000` (6 h) | The deadline of a run whose lane and command line name none. An integer from `60000` to `86400000` (24 h); anything else, `0` and `null` included, fails the config load. |
+| `deadlineMs` | a lane in `.lane-broker.json` | absent: the global value | Per-lane value in the same range (an undeclared lane inherits its `as` template's). An explicit `null` or `0` is refused: a lane cannot turn the deadline off, it can only omit the key. |
+| `deadlineEnforcement` | global `config.json` | `audit` | `audit` or `enforce`. Read only on the host that executes the run and never sent to a runner. In this release it changes nothing; the kill arrives in R2. |
+| `--deadline <dur>` | `lane run` | none | See the flags table; refused (exit `64`) inside an inherited lease. |
+
+The effective deadline is the first of `--deadline`, the lane's `deadlineMs`, the global `deadlineMs`. The ticket records it as `deadlineMs` with `deadlineSource` (`cli`, `lane` or `global`). It is not yet sent in the dispatch header.
+
+The agent's wall-clock kill (`maxRunMs`, below) settles as `exit: 124`, `reason: "run-limit"` with `runLimitMs`, and that reason now survives every hop, push and pull: the runner's result, the submitter's result, adoption by `lane reconcile` and the history row all carry it, so `lane result --json` shows `reason: "run-limit"` instead of a bare exit 124. The shared relay is `relayedSettlement` in `src/reasons.js`, which forwards `reason` with its window (`noProgressTimeoutMs`, `silenceTimeoutMs`, `runLimitMs` or `deadlineMs`) plus `deadline`, `guard` and `stopProven`; the reserved reason `deadline_exceeded` travels the same way.
 
 #### Pull-lane guard in the agent (PKG-397)
 

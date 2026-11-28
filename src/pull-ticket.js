@@ -15,6 +15,7 @@ import { makeReader } from './remote-stream.js';
 import { sha256AndSize } from './s3-client.js';
 import { sha256Hex } from './s3-presign.js';
 import { relayedRanOn } from './ran-on.js';
+import { relayedSettlement } from './reasons.js';
 import { atomicWriteJson, ensureDurableDir, fsyncDirectory, fsyncFile, isCancelled, LockTimeoutError, readJsonSafe } from './state.js';
 import { CappedLogWriter, LOG_CAP_BYTES, publishAttemptTerminal } from './supervisor.js';
 
@@ -310,7 +311,7 @@ const resultWriterOf = (run) => run.writeResult ?? ((result, { fsync }) => atomi
 
 const defaultFinishedResult = (run, entry, attempt, extra) => ({
   id: run.id, exit: entry.decision.exit, signal: null, executor: 'remote', transport: 'pull', runner: entry.host, startedAt: attempt.startedAt, endedAt: Date.now(),
-  ...(entry.decision.phase ? { phase: entry.decision.phase } : {}), ...extra,
+  ...(entry.decision.phase ? { phase: entry.decision.phase } : {}), ...relayedSettlement(entry.result), ...extra,
 });
 
 export const pullCancelledResult = (id, startedAt, runnerResult) => ({ ...remoteCancelledResult(id, startedAt), transport: 'pull', ...relayedRanOn(runnerResult) });

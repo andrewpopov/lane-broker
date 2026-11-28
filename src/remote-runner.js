@@ -15,7 +15,7 @@ import { enforcementOf } from './cpu-limit.js';
 import { createStrictGunzip, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-gzip.js';
 import { blobNamespace, evictBlobs, acquireBlobLeases, haveBlobs, isBlobHash, isCacheable, HAVE_LEASE_TTL_MS } from './remote-blobs.js';
 import { reportReadiness } from './runner-readiness.js';
-import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
+import { relayedSettlement } from './reasons.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
 import { isValidGroupId, remotePriorityFrom } from './priority.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
@@ -261,7 +261,7 @@ function readPhasesMs(ticketDir, own) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-export function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, executionCpuCores, observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs, artifacts, ranOn, neverStarted, stopProven, shutdownProof }) {
+export function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, settlement = {}, runMs, queuedMs, grantedCpuCores, executionCpuCores, observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs, artifacts, ranOn, neverStarted, stopProven, shutdownProof }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -273,9 +273,8 @@ export function buildResult(header, ticketDir, { kind, exit = null, signal = nul
     signal,
     remoteLaneId,
     reason,
-    // BRAIN-431: additive; the window a 'no-progress' kill elapsed, so the submitter can say how long
-    noProgressTimeoutMs,
-    silenceTimeoutMs, // BRAIN-576: the window a 'silence' kill elapsed
+    // BRAIN-431/576: additive; the window a 'no-progress' or 'silence' kill elapsed (plus the run-limit and deadline fields), so the submitter can say how long
+    ...settlement,
     // Omitted entirely (not merely null) for a protocol-1 result -- JSON.stringify
     // drops an `undefined` value, so the shape stays byte-identical to before
     // this slice (I6).
@@ -767,8 +766,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let exit = null;
   let signal = null;
   let reason = null;
-  let noProgressTimeoutMs;
-  let silenceTimeoutMs;
+  let settlement = {};
   let runMs;
   let queuedMs;
   let observedCpu;
@@ -801,13 +799,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   } else if (structured && structured.provenanceOnly !== true) {
     exit = structured.exit;
     signal = structured.signal;
-    if (structured.reason === NO_PROGRESS_REASON && Number.isFinite(structured.noProgressTimeoutMs)) {
-      reason = NO_PROGRESS_REASON;
-      noProgressTimeoutMs = structured.noProgressTimeoutMs;
-    } else if (structured.reason === SILENCE_REASON && Number.isFinite(structured.silenceTimeoutMs)) {
-      reason = SILENCE_REASON;
-      silenceTimeoutMs = structured.silenceTimeoutMs;
-    }
+    settlement = relayedSettlement(structured);
+    reason = settlement.reason ?? null;
     observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
     observedRssPeakBytes = sanitizeRssPeak(structured.observedRssPeakBytes);
     observedCgroupMemoryPeakBytes = sanitizeRssPeak(structured.observedCgroupMemoryPeakBytes);
@@ -839,7 +832,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
   if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    const built = buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts, ranOn, neverStarted, stopProven: structured?.stopProven === true, shutdownProof });
+    const built = buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, settlement, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts, ranOn, neverStarted, stopProven: structured?.stopProven === true, shutdownProof });
     // BRAIN-350: an unproven stop names the boot it happened in; a later boot proves the job died with it (servedRecord)
     publishResult(reason === RUNNER_SHUTDOWN_UNPROVEN_REASON ? { ...built, shutdownBootId: kernelBootId() } : built);
   } finally {

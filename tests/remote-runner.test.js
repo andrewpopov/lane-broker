@@ -16,6 +16,7 @@ import { enqueue, listQueue, reapOrphanedQueue } from '../src/scheduler.js';
 import { remoteResultCommand, buildResult } from '../src/remote-runner.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { tmpBase } from '../src/gc.js';
+import { reapSpawned, setupRunner, makeHeader as makeExecHeader, execRemote, readExecResult, ticketPath, hasLease } from './helpers/remote-exec-fixture.js';
 
 function tmpDir(prefix) {
   return makeTmpDir(`${prefix}-`);
@@ -1605,4 +1606,46 @@ test('BRAIN-926: remoteDepsCacheKeyFilesCoverInstallScripts needs protocol 2, th
   const accepted = await getResult(header.ticketId, root, env);
   assert.equal(accepted.kind, 'completed', JSON.stringify(accepted));
   assert.equal(accepted.exit, 0);
+});
+
+// ---- BRAIN-940 R1: a kill's reason in the local broker's record survives into the runner's published result ----
+
+afterEach(reapSpawned);
+
+const KILLS = {
+  'run-limit': { exit: 124, reason: 'run-limit', runLimitMs: 21_600_000, guard: 'run-limit', stopProven: true },
+  deadline_exceeded: { exit: 124, reason: 'deadline_exceeded', deadlineMs: 60_000, deadline: { ms: 60_000, source: 'lane', mode: 'enforce' }, stopProven: false },
+};
+
+async function publishedKill(record) {
+  const gate = makeTmpDir('kill-hold-');
+  const hold = { LANE_BROKER_TEST_HOLD_AT: 'remote-exec-before-result', LANE_BROKER_TEST_HOLD_READY: path.join(gate, 'ready'), LANE_BROKER_TEST_HOLD_GO: path.join(gate, 'go') };
+  const ctx = setupRunner();
+  const h = makeExecHeader('process.exit(0)');
+  const { closed } = execRemote(ctx, h, { env: { ...ctx.env, ...hold } });
+  await waitFor(() => fs.existsSync(hold.LANE_BROKER_TEST_HOLD_READY), { timeoutMs: 30_000 });
+  await waitFor(() => !hasLease(ctx), { timeoutMs: 10_000 });
+  const laneId = fs.readFileSync(ticketPath(ctx, h.ticketId, 'remote-id'), 'utf8').trim();
+  const resultFile = path.join(paths(ctx.state).results, `${laneId}.json`);
+  fs.writeFileSync(resultFile, JSON.stringify({ ...readJsonSafe(resultFile), ...record }));
+  fs.writeFileSync(hold.LANE_BROKER_TEST_HOLD_GO, 'go');
+  assert.equal((await closed).code, 0);
+  return readExecResult(ctx, h.ticketId);
+}
+
+for (const [name, record] of Object.entries(KILLS)) {
+  test(`remote-exec relays a ${name} kill from the local result into the published result`, async () => {
+    const result = await publishedKill(record);
+    assert.equal(result.kind, 'completed');
+    assert.equal(result.exit, 124);
+    assert.equal(result.reason, name);
+    for (const field of ['runLimitMs', 'deadlineMs', 'deadline', 'guard', 'stopProven']) {
+      if (field in record) assert.deepEqual(result[field], record[field], field);
+    }
+  });
+}
+
+test('buildResult carries the settlement fields it is handed', () => {
+  const result = buildResult(makeHeader(), tmpDir('settlement-wire'), { kind: 'completed', exit: 124, reason: 'run-limit', settlement: { reason: 'run-limit', runLimitMs: 5, guard: 'run-limit' } });
+  assert.deepEqual([result.reason, result.runLimitMs, result.guard], ['run-limit', 5, 'run-limit']);
 });
