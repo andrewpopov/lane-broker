@@ -18,7 +18,8 @@
     "pr": {
       "weight": 2,
       "cpuCores": 2,
-      "minCpuCores": 1,
+      "minCpuCores": 2,
+      "rightSize": false,
       "maxConcurrent": 8,
       "silenceTimeoutMs": 1200000
     }

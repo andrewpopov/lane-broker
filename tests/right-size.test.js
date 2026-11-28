@@ -10,6 +10,8 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId } from '../src/state.js';
 
+const REPO_PR_LANE = JSON.parse(fs.readFileSync(new URL('../.lane-broker.json', import.meta.url), 'utf8')).lanes.pr;
+
 // BRAIN-550: a lane's CPU request follows what its finished runs used, within [floor, declared].
 
 const NOW = 1_800_000_000_000;
@@ -134,6 +136,15 @@ test('lane run: a right-sized lane with a floor can still be granted down to its
   const f = await fixture({ lane: { weight: 1, cpuCores: 4, minCpuCores: 2 }, means: [0.1, 0.1, 0.1, 0.1, 0.1] });
   const r = await laneRun(f.args, { env: f.env, cwd: f.repoDir });
   assert.match(r.stdout, /grant=2\b/);
+});
+
+test('PKG-472: this repo\'s pr lane declaration is granted 2 cores whatever its history says (a floor equal to the claim drops, so rightSize must be off)', async () => {
+  const lane = { weight: REPO_PR_LANE.weight, cpuCores: REPO_PR_LANE.cpuCores, minCpuCores: REPO_PR_LANE.minCpuCores, rightSize: REPO_PR_LANE.rightSize };
+  const f = await fixture({ lane, means: [0.1, 0.1, 0.1, 0.1, 0.1] });
+  const r = await laneRun(f.args, { env: f.env, cwd: f.repoDir });
+  assert.match(r.stdout, /grant=2\b/);
+  const control = await fixture({ lane: { ...lane, rightSize: undefined }, means: [0.1, 0.1, 0.1, 0.1, 0.1] });
+  assert.match((await laneRun(control.args, { env: control.env, cwd: control.repoDir })).stdout, /grant=1\b/, 'without rightSize:false the same declaration shrinks to 1 core');
 });
 
 test('lane status shows declared to granted for a right-sized lease', async () => {

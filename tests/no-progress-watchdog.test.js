@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep, stripLogTimestamps } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep, stripLogTimestamps, releaseAndReap, scaledMs } from './helpers.js';
 import { setup, resultOf } from './remote-harness.js';
 import { paths } from '../src/state.js';
 import { readLease } from '../src/lease.js';
@@ -102,27 +102,33 @@ test('config: noProgressTimeoutMs defaults to 0 (kill off) and is validated glob
 
 const logAllReaps = (state, id) => stripLogTimestamps(fs.readFileSync(paths(state).admissionLog, 'utf8')).split('\n').filter((l) => l.startsWith(`lane-broker-reap id=${id} descendants-reaped=`));
 
-const QUIET_THEN_EXIT = node(`process.stdout.write('started\\n'); setTimeout(() => {}, 3500);`);
 // idle 1.2s, a CPU burst, idle 1.2s: no idle streak reaches the 2s window, though the silent total does
 const BURST_BETWEEN_IDLES = node(`process.stdout.write('x'); setTimeout(() => { const end = Date.now() + 400; while (Date.now() < end) {} setTimeout(() => {}, 1200); }, 1200);`);
 // a silent coordinator that keeps starting short-lived workers (each is a NEW pid in the tree) and uses ~no CPU itself
 const WORKER_CHURN = ['sh', '-c', 'echo x; for i in 1 2 3 4 5 6 7 8; do sleep 0.5; done'];
 
-test('default config: a silent run is NEVER killed, but the stall is recorded in status and in the history row', async () => {
+test('default config: a silent run is NEVER killed, but the stall is recorded in status and in the history row', async (t) => {
   const s = localSetup();
   writeRepoConfig(s.repoDir, { version: 1, lanes: { default: { weight: 1 } } });
-  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...QUIET_THEN_EXIT], { env: s.env, cwd: s.repoDir });
+  // Silent until released, not for a fixed 3.5 s: on a slow host a timed command can finish before status ever reports its stall.
+  // Released only after the stall outlasts WINDOW_MS, so a kill at that window (which this default config must never make) would be seen.
+  const release = path.join(s.repoDir, 'release-quiet-run');
+  // never shorter than the longest this test waits (the scaled stall wait) plus the teardown's own grace
+  const HOLD_MS = scaledMs(60_000) + scaledMs(30_000);
+  const quietUntilReleased = node(`process.stdout.write('started\\n'); const t0 = Date.now(); const poll = setInterval(() => { if (require('fs').existsSync(${JSON.stringify(release)}) || Date.now() - t0 > ${HOLD_MS}) clearInterval(poll); }, 100);`);
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...quietUntilReleased], { env: s.env, cwd: s.repoDir });
+  t.after(() => releaseAndReap(child, release, { state: s.state }));
   const seen = await waitFor(async () => {
     const status = JSON.parse((await laneRun(['status', '--json'], { env: s.env })).stdout);
     const stalled = status.running[0]?.noProgressSinceMs;
-    return stalled >= 1000 ? stalled : null;
-  }, { timeoutMs: 8000, intervalMs: 300 });
-  assert.ok(seen >= 1000, 'status reports the running stall');
-  await new Promise((resolve) => (child.exitCode !== null ? resolve() : child.on('exit', resolve)));
-  assert.equal(child.exitCode, 0);
+    return stalled >= WINDOW_MS + 500 ? stalled : null;
+  }, { timeoutMs: 60_000, intervalMs: 300 });
+  const released = await releaseAndReap(child, release, { state: s.state });
+  assert.ok(seen >= WINDOW_MS + 500, 'status reports the running stall, past the window an opt-in lane would be killed at');
+  assert.deepEqual([released.code, released.signal, released.escalated], [0, null, false], 'the released run exits 0 by itself');
   const [row] = historyOf(s.state);
   assert.equal(row.reason, undefined);
-  assert.ok(row.maxNoProgressMs >= 1500, `longest stretch recorded; got ${row.maxNoProgressMs}`);
+  assert.ok(row.maxNoProgressMs >= WINDOW_MS, `longest stretch recorded; got ${row.maxNoProgressMs}`);
 });
 
 test('opt-in lane: a CPU burst between two idle stretches resets the window (the kill needs CONSECUTIVE idle time)', async () => {

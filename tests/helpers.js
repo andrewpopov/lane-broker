@@ -133,6 +133,74 @@ export function laneSpawn(args, { env, cwd, bin = BIN } = {}) {
   return spawn(process.execPath, [bin, ...args], { env, cwd: cwd || process.cwd() });
 }
 
+/** The records a test's broker state names: leases (supervisor, and the command's group) and still-queued tickets (supervisor). */
+async function brokerRecords(state) {
+  const { paths, readJsonSafe } = await import('../src/state.js');
+  const records = (dir) => {
+    try {
+      return fs.readdirSync(dir).filter((n) => n.endsWith('.json')).map((n) => readJsonSafe(path.join(dir, n))).filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
+  const { leases, queue } = paths(state);
+  return { leases: records(leases), queued: records(queue) };
+}
+
+/**
+ * Release a `lane run` held by a release file and wait, bounded, for it and the broker processes `state` names (its detached supervisor,
+ * its command's group) to be gone. A deadline escalates to SIGTERM then SIGKILL; anything still alive after the last deadline throws.
+ * Every target is kept with its identity (supervisor start time, lease leader/marker) and re-verified before each signal, so a pid or pgid the OS
+ * reused is neither signalled nor waited for. `known` is `[{ pid, start }]` supervisors the caller already holds (one whose queue record is gone).
+ * Resolves `{ code, signal, escalated }` so a success path can assert the exit it released into.
+ */
+export async function releaseAndReap(child, releaseFile, { state, known = [], graceMs = scaledMs(15_000), killMs = scaledMs(5_000) } = {}) {
+  const { isPidAlive, isGroupAlive } = await import('../src/lease.js');
+  const { isVerifiedProcess, isConfirmedGone } = await import('../src/process-liveness.js');
+  const { groupHasLeaseMember } = await import('../src/descendants.js');
+  fs.writeFileSync(releaseFile, '');
+  const childGone = () => child.exitCode !== null || child.signalCode !== null;
+  // a lease vanishes when its supervisor does, so remember every target seen: an orphaned command group must still be waited for and killed
+  const supervisors = new Map(known.map(({ pid, start }) => [pid, { pid, start }]));
+  const leases = new Map();
+  const remember = async () => {
+    const seen = await brokerRecords(state);
+    for (const r of [...seen.leases, ...seen.queued]) {
+      if (Number.isInteger(r.supervisorPid) && !supervisors.get(r.supervisorPid)?.start) supervisors.set(r.supervisorPid, { pid: r.supervisorPid, start: r.supervisorStart ?? null });
+    }
+    for (const lease of seen.leases) if (Number.isInteger(lease.childPgid)) leases.set(lease.id, lease);
+  };
+  const aliveSupervisors = () => [...supervisors.values()].filter(({ pid, start }) => !isConfirmedGone(pid, start) && isPidAlive(pid));
+  const aliveGroups = () => [...leases.values()].filter((lease) => isGroupAlive(lease.childPgid) && groupHasLeaseMember(lease));
+  const alive = async () => {
+    await remember();
+    return [...(childGone() ? [] : [`cli ${child.pid}`]), ...aliveSupervisors().map(({ pid }) => `supervisor ${pid}`), ...aliveGroups().map((lease) => `group ${lease.childPgid}`)];
+  };
+  const kill = async (signal) => {
+    await remember();
+    if (!childGone()) child.kill(signal);
+    for (const { pid, start } of supervisors.values()) if (isVerifiedProcess(pid, start)) try { process.kill(pid, signal); } catch { /* gone */ }
+    for (const lease of aliveGroups()) try { process.kill(-lease.childPgid, signal); } catch { /* gone */ }
+  };
+  const settle = async (ms) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if ((await alive()).length === 0) return true;
+      await sleep(50);
+    }
+    return (await alive()).length === 0;
+  };
+  let escalated = false;
+  for (const [signal, ms] of [[null, graceMs], ['SIGTERM', killMs], ['SIGKILL', killMs]]) {
+    if (signal) {
+      escalated = true;
+      await kill(signal);
+    }
+    if (await settle(ms)) return { code: child.exitCode, signal: child.signalCode, escalated };
+  }
+  throw new Error(`teardown left processes running: ${(await alive()).join(', ')}`);
+}
+
 let localEnvVarNames = null;
 
 /**
