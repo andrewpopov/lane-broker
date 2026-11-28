@@ -16,7 +16,8 @@ const TOO_MANY_CONNECTIONS = '53300';
 // SQL parameter types in order (a call sends as many as it has arguments, so a call that names none of the trailing defaults runs against an older schema); `idempotent` says whether a call that may already have committed can be sent again
 const FUNCTIONS = {
   ld_queue_ref: { types: [], idempotent: true },
-  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]', 'text[]', 'real'], idempotent: false },
+  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]', 'text[]', 'real', 'text'], idempotent: false },
+  ld_ticket_by_key: { types: ['text'], idempotent: true },
   ld_get: { types: ['uuid'], idempotent: true },
   ld_list_mine: { types: ['text[]', 'int'], idempotent: true },
   ld_withdraw: { types: ['uuid'], idempotent: false },
@@ -124,14 +125,19 @@ export function createQueueClient({
   return {
         queueRef: (options) => invoke('ld_queue_ref', [], options),
 
-        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], requires = [], cpuCores, minCpuCores, memoryBytes, priority = 0, minProtocol = 1 }) => {
-      // only a lane that sets avoidTags (007), requires (008) or an elastic floor (009) needs the longer function, so every other enqueue still works against an older queue
+        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], requires = [], cpuCores, minCpuCores, memoryBytes, priority = 0, minProtocol = 1, dispatchKey }) => {
+      // only a lane that sets avoidTags (007), requires (008), an elastic floor (009) or a dispatch key (012) needs the longer function, so every other enqueue still works against an older queue
+      // a dispatch key is never trimmed off: the long form carries it, and a queue without it answers 42883, which the caller turns into a refusal
       const elastic = Number.isFinite(minCpuCores) && minCpuCores < cpuCores;
-      const trailing = elastic ? [true, null, null, avoidTags, requires, minCpuCores]
+      const trailing = dispatchKey !== undefined ? [true, null, null, avoidTags, requires, elastic ? minCpuCores : null, dispatchKey]
+        : elastic ? [true, null, null, avoidTags, requires, minCpuCores]
         : requires.length > 0 ? [true, null, null, avoidTags, requires]
         : avoidTags.length > 0 ? [true, null, null, avoidTags] : [];
       return invoke('ld_enqueue_fenced', [expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, cpuCores, memoryBytes, priority, minProtocol, ...trailing]);
     },
+
+        /** The caller's own live ticket under `dispatchKey`, or null. */
+        ticketByKey: (dispatchKey, options) => invoke('ld_ticket_by_key', [dispatchKey], options),
 
         get: (id) => invoke('ld_get', [id]),
 

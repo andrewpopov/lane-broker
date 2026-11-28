@@ -72,9 +72,9 @@ export async function call(client, name, ...args) {
 
 export const tid = gid;
 
-export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [], requires = [], minCpu, weight } = {}) =>
+export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [], requires = [], minCpu, weight, dispatchKey } = {}) =>
   call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'], ...(weight === undefined ? {} : { weight }) }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags, requires,
-    ...(minCpu === undefined ? [] : [minCpu]));
+    ...(dispatchKey !== undefined ? [minCpu ?? null, dispatchKey] : minCpu === undefined ? [] : [minCpu]));
 
 /** `capacity` (the runner's whole CPU budget, BRAIN-1099) and `freeWeight` with `weightLimit` (BRAIN-1106) are sent only when given, so the default call carries neither, as an older agent's does. */
 export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [], has, capacity, capacityMem = 1e10, freeWeight, weightLimit = null } = {}) =>
@@ -132,6 +132,10 @@ export async function downgradeToV8(world) {
 /** Puts the world's queue back to schema version 9 (the 9e7487f functions.sql, BRAIN-1099): no 010 function signatures. */
 export async function downgradeToV9(world) {
   const su = await world.su();
+  // PKG-438 (migration 012): the dispatch-key enqueues and lookup go; the column and its index stay, which a v9 function never reads
+  await su.query('DROP FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text)');
+  await su.query('DROP FUNCTION lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text)');
+  await su.query('DROP FUNCTION lane_dispatch.ld_ticket_by_key(text)');
   await su.query('DELETE FROM lane.schema_version WHERE version = 10');
   await su.query('DROP FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint, real, real)');
   await su.query('DROP FUNCTION lane_dispatch.ticket_weight(jsonb, real)');
