@@ -98,6 +98,9 @@ export class RunnerWorld {
     const calls = [];
     const { startAgent } = await load('agent/run.js');
     const { createS3Client } = await load('s3-client.js');
+    const { sampleDevice } = await load('device-gates.js');
+    // PKG-440: the default-on load and memory gates must never read this host's real load or memory pressure inside a test (a paging host closed the memory gate and no claim was made); a test that drives it passes its own deviceSampler.
+    const deviceSampler = (gates) => sampleDevice(gates, { platform: rest.platform ?? process.platform, cpuLoad: async () => null, memoryPressure: () => null });
     const rustfs = { ...this.rustfs, ...config.rustfs };
     const agent = await startAgent({
       remoteRoot: this.root, version: 'test', figures: () => ({ freeCpu: 8, freeMem: 4e9 }), spawnEnv: this.ctx.env, laneBin: BIN, log: (line) => this.logs.push(line),
@@ -107,6 +110,7 @@ export class RunnerWorld {
       coreOptions: { onCall: (name, args) => calls.push([name, args, Date.now()]), backoff: { minMs: 20, maxMs: 100 }, ...coreOptions },
       ...(Driver ? { Driver } : {}),
       driverOptions: { scopeRequired: false, probeScope: async () => ({ available: false, reason: 'tests: no scope' }), ...driverOptions },
+      deviceSampler,
       ...rest,
     });
     this.agents.push(agent);

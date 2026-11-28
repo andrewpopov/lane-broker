@@ -8,11 +8,11 @@ import { Waker } from './waker.js';
 import { writeAgentMetrics } from './metrics.js';
 import { openBudgetShadow } from './budget.js';
 import { userManagerEnv } from '../cpu-limit.js';
-import { sampleDevice, updateDeviceGates } from '../device-gates.js';
+import { loadApproaching, sampleDevice, updateDeviceGates } from '../device-gates.js';
 
 export const STOP_SETTLE_MS = 45_000;
 
-const UNKNOWN_DEVICE_SAMPLE = { thermal: {}, power: {}, memory: {} };
+const UNKNOWN_DEVICE_SAMPLE = { thermal: {}, power: {}, memory: {}, load: {} };
 
 export const s3ClientOf = ({ endpoint, region, creds }, options = {}) => createS3Client({ endpoint, region, creds, ...options });
 
@@ -74,7 +74,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       log(`metrics: ${err.message}`);
     }
   };
-  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, owners: () => drainOwners(config.stateDir), deviceGates });
+  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, owners: () => drainOwners(config.stateDir), deviceGates, idle: !core.table.all().some((r) => r.subphase !== 'DONE') });
 
   const reloadDeviceGatesConfig = () => {
     try {
@@ -105,8 +105,11 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
 
   const deviceGateStatus = () => Object.fromEntries(Object.entries(deviceGates).map(([name, { closed, consecutiveOk, reading, sensor }]) => [name, { closed, consecutiveOk, reading, ...(sensor ? { sensor } : {}) }]));
 
+  // PKG-440: a NOTIFY (including the one our own claim raises) starts a tick at once, so while load approaches its limit the pace is one claim per pollMs, not per tick.
+  let hotClaimAt = -Infinity;
   async function claimRound() {
     while (!stopped && !upgradeRequired) {
+      if (loadApproaching(deviceGates, deviceGatesConfig) && now() - hotClaimAt < config.pollMs) return;
       let answer;
       try {
         answer = await claimOnce({ core, remoteRoot, figures: claimFiguresOf, block, now, tools: claimTools, log });
@@ -120,6 +123,12 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       else if (answer.status === 'claimed') {
         claimed += 1;
         driver.adopt(answer.execId);
+        const claimedAt = now();
+        await refreshDeviceGates(); // self-gating: a sample that fell due during a long round is taken before the next claim, so block() and the pacing see it
+        if (loadApproaching(deviceGates, deviceGatesConfig)) {
+          hotClaimAt = claimedAt;
+          return;
+        }
       }
       else return;
     }

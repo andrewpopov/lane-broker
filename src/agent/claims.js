@@ -24,8 +24,8 @@ export const drainsOf = (stateDir = stateHome()) => readDrainMarkers(stateDir).m
 
 export const isDraining = (stateDir = stateHome()) => drainOwners(stateDir).length > 0;
 
-/** Why this runner takes no new claim now, or null: a drain marker, outside its schedule window, too close to the window closing, or a closed device gate. */
-export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining, owners = () => [], deviceGates }) {
+/** Why this runner takes no new claim now, or null: a drain marker, outside its schedule window, too close to the window closing, or a closed device gate (the load gate not while `idle`, PKG-440). */
+export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining, owners = () => [], deviceGates, idle = false }) {
   if (draining()) {
     const by = owners();
     return by.length ? `draining (${by.join(', ')})` : 'draining';
@@ -33,7 +33,7 @@ export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now
   const { available, closesAt } = runnerAvailability(schedule, now);
   if (!available) return 'outside-schedule';
   if (closesAt !== null && closesAt - now <= stopClaimingBeforeCloseMs) return 'closing-soon';
-  return closedGateReason(deviceGates);
+  return closedGateReason(deviceGates, { idle });
 }
 
 export function brokerConfigReader({ log }) {

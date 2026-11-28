@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { makeTmpDir } from './helpers/tmp.js';
-import { AgentOwnedError, agentPaths, claimOwner, ensureAgentDirs, readAgentStatus, readOwner, writeStatus } from '../src/agent/store.js';
+import { AgentOwnedError, agentPaths, claimOwner, ensureAgentDirs, readAgentStatus, readCurrentAgentGates, readOwner, writeStatus } from '../src/agent/store.js';
 import { processStartTime, withLock } from '../src/state.js';
 
 let remoteRoot;
@@ -101,6 +101,16 @@ test('--status reads the live owner\'s last status.json tick, and reports no-own
   const status = readAgentStatus(remoteRoot);
   assert.deepEqual([status.state, status.host, status.pid], ['running', 'a1', process.pid]);
   assert.equal(JSON.parse(fs.readFileSync(agentPaths(remoteRoot).status, 'utf8')).host, 'a1');
+});
+
+test('PKG-440: lane status takes the device gates only from the live owner\'s own status.json, never one a previous agent left behind', async () => {
+  await claimOwner(remoteRoot);
+  assert.equal(readCurrentAgentGates(remoteRoot), null, 'no status yet');
+  writeStatus(remoteRoot, { deviceGates: { load: { closed: true } } });
+  assert.deepEqual(readCurrentAgentGates(remoteRoot), { load: { closed: true } });
+  const file = agentPaths(remoteRoot).status;
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), pid: process.pid + 100000 }));
+  assert.equal(readCurrentAgentGates(remoteRoot), null, 'a stale record from another pid is ignored');
 });
 
 test('--status reports no-owner once the owner that wrote the last tick has died', async () => {

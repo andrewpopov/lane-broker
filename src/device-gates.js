@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { atomicWriteJson, fingerprintOf, paths, readJsonSafe } from './state.js';
@@ -51,6 +52,18 @@ const GATES = {
         || known(swapMiBPerSec) && swapMiBPerSec > cfg.maxSwapMiBPerSec;
       return paging ? 'memory-pressure' : null;
     },
+  },
+  // PKG-440: load average alone misleads (zirkbot: load 16 at 56% idle), so the gate closes only when the 5-minute load per core AND
+  // the host's busy fraction are both high. Evidence: zirkbot load 29.6 on 12 cores; workbook-pro load 23 on 12 cores, a 2 h suite against a 36-minute median.
+  load: {
+    defaultOpenSamples: 3,
+    unknownOpenSamples: 3,
+    idleExempt: true,
+    approachingFraction: 0.8,
+    defaults: { maxLoadPerCore: 1.2, minBusyFraction: 0.85 },
+    thresholds: { maxLoadPerCore: numberIn(0.1, 100), minBusyFraction: numberIn(0.01, 1) },
+    informative: (_cfg, { load5PerCore, busyFraction }) => known(load5PerCore) && known(busyFraction),
+    violation: (cfg, { load5PerCore, busyFraction }) => (known(load5PerCore) && known(busyFraction) && load5PerCore > cfg.maxLoadPerCore && busyFraction >= cfg.minBusyFraction ? 'load' : null),
   },
 };
 
@@ -154,7 +167,15 @@ export function sampleMemoryGate(root, deviceGates, { read = () => readMemoryPre
 
 export const readMemoryGate = (root, deviceGates) => (gateConfigOf('memory', deviceGates) === null ? OPEN_MEMORY_GATE : readJsonSafe(paths(root).memoryGate) ?? OPEN_MEMORY_GATE);
 
-export const closedGateReason = (states) => Object.values(states ?? {}).find((state) => state.closed)?.reason ?? null;
+// PKG-440: with `idle` (the agent runs nothing) a gate marked `idleExempt` does not block: a runner always keeps one lane.
+export const closedGateReason = (states, { idle = false } = {}) => Object.entries(states ?? {}).find(([name, state]) => state.closed && !(idle && GATES[name]?.idleExempt))?.[1].reason ?? null;
+
+// PKG-440: the load reading is within `approachingFraction` of its limit, so a claim round takes one ticket: loadavg5 lags and cannot see this tick's own claims.
+export function loadApproaching(states, deviceGates) {
+  const gateCfg = gateConfigOf('load', deviceGates);
+  const load5PerCore = states?.load?.reading?.load5PerCore;
+  return gateCfg !== null && known(load5PerCore) && load5PerCore > gateCfg.maxLoadPerCore * GATES.load.approachingFraction;
+}
 
 export const parsePressureLevel = (text) => {
   const level = /thermalpressurelevel\s+(\d+)/.exec(text)?.[1];
@@ -219,6 +240,50 @@ const SENSORS = {
   },
 };
 
+// PKG-440: a whole-host CPU snapshot `{ busy, total }` in ticks, uncapped by any cgroup. On Linux the aggregate `cpu` line of /proc/stat:
+// libuv's os.cpus() drops iowait, which would read an I/O-bound window as busy, so iowait and steal count as not-busy but stay in the total.
+// Elsewhere os.cpus() (user + nice + sys + irq busy, plus idle).
+export function parseProcStatCpu(text) {
+  const fields = /^cpu\s+(.+)$/m.exec(text ?? '')?.[1].trim().split(/\s+/).map(Number);
+  if (!fields || fields.length < 4 || !fields.every(Number.isFinite)) return null;
+  const [user, nice, system, idle, iowait = 0, irq = 0, softirq = 0, steal = 0] = fields; // guest time is already inside user and nice
+  return { busy: user + nice + system + irq + softirq, total: user + nice + system + idle + iowait + irq + softirq + steal };
+}
+
+export function readCpuSnapshot({ platform = process.platform, readStat = () => fs.readFileSync('/proc/stat', 'utf8'), cpus = os.cpus } = {}) {
+  if (platform === 'linux') {
+    // No os.cpus() fallback here: it drops iowait, and a window mixing /proc/stat ticks with os.cpus() milliseconds is meaningless. Unknown never closes the gate.
+    try {
+      return parseProcStatCpu(readStat());
+    } catch {
+      return null;
+    }
+  }
+  const sums = cpus().reduce((sum, { times: t }) => ({ busy: sum.busy + t.user + t.nice + t.sys + t.irq, total: sum.total + t.user + t.nice + t.sys + t.irq + t.idle }), { busy: 0, total: 0 });
+  return Number.isFinite(sums.total) && sums.total > 0 ? sums : null;
+}
+
+const CPU_WINDOW_MS = 250;
+const MAX_CPU_WINDOW_OVERRUN_MS = 5000;
+
+// PKG-440: 5-minute loadavg per logical core, and the host busy fraction over two whole-host snapshots about 250 ms apart (busy delta / total delta
+// across every logical CPU). It does not use measureHostCpuReadOnly: that caps busy cores at cgroup capacity and runs a synchronous vm_stat.
+export async function readCpuLoad({ loadavg = os.loadavg, cores = () => os.cpus().length, platform = process.platform, readSnapshot = () => readCpuSnapshot({ platform }), gapMs = CPU_WINDOW_MS, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), clock = Date.now } = {}) {
+  const logical = cores();
+  const first = readSnapshot();
+  const startedAt = clock();
+  await sleep(gapMs);
+  const second = readSnapshot();
+  // A window far longer than asked (the process was suspended) averages CPU over minutes against a current loadavg: treat it as unknown.
+  const fresh = clock() - startedAt <= gapMs + MAX_CPU_WINDOW_OVERRUN_MS;
+  const total = fresh && second && first ? second.total - first.total : NaN;
+  const busy = second && first ? second.busy - first.busy : NaN;
+  return {
+    load5PerCore: logical > 0 ? loadavg()[1] / logical : null,
+    busyFraction: Number.isFinite(total) && Number.isFinite(busy) && total > 0 && busy >= 0 ? Math.min(1, busy / total) : null,
+  };
+}
+
 const read = async (sensor, io) => {
   try {
     return (await sensor?.(io)) ?? null;
@@ -228,28 +293,34 @@ const read = async (sensor, io) => {
 };
 
 // A sensor this platform lacks, no threshold needs, or that fails reads null (unknown). Never throws.
-export async function sampleDevice(deviceGates, { platform = process.platform, exec = execCommand, sysRoot = '/sys', memoryPressure = () => readMemoryPressure({ platform }) } = {}) {
-  const io = { exec, sysRoot };
+export async function sampleDevice(deviceGates, { platform = process.platform, exec = execCommand, sysRoot = '/sys', memoryPressure = () => readMemoryPressure({ platform }), cpuLoad = readCpuLoad } = {}) {
+  const io = { exec, sysRoot, platform };
   const sensors = SENSORS[platform] ?? {};
   const uses = (name, ...keys) => keys.some((key) => gateConfigOf(name, deviceGates)?.[key] !== undefined);
-  const [pressureLevel, cpuSpeedLimit, maxTempC, power, memory] = await Promise.all([
+  const [pressureLevel, cpuSpeedLimit, maxTempC, power, memory, load] = await Promise.all([
     uses('thermal', 'maxPressureLevel') ? read(sensors.pressureLevel, io) : null,
     uses('thermal', 'minCpuSpeedLimit') ? read(sensors.cpuSpeedLimit, io) : null,
     uses('thermal', 'maxTempC') ? read(sensors.maxTempC, io) : null,
     uses('power', 'requireAc', 'minBatteryPercent') ? read(sensors.power, io) : null,
     gateConfigOf('memory', deviceGates) ? read(memoryPressure, io) : null,
+    gateConfigOf('load', deviceGates) ? read(cpuLoad, io) : null,
   ]);
   return {
     thermal: { pressureLevel, cpuSpeedLimit, maxTempC },
     power: { onAc: power?.onAc ?? null, batteryPercent: power?.batteryPercent ?? null },
     memory: { vmPressureLevel: memory?.vmPressureLevel ?? null, psiSomeAvg10: memory?.psiSomeAvg10 ?? null, swapBytes: memory?.swapBytes ?? null, at: memory?.at ?? null },
+    load: { load5PerCore: load?.load5PerCore ?? null, busyFraction: load?.busyFraction ?? null },
   };
 }
 
-export function liveDeviceGates(deviceGates, sample, previous = {}) {
+// `recorded` holds a running agent's own state ({closed}) per gate: it is what the agent enforces, so a gate it still holds closed shows CLOSED
+// whatever one fresh reading says (hysteresis); without it the gate is judged by the fresh reading alone.
+export function liveDeviceGates(deviceGates, sample, previous = {}, recorded = {}) {
   return Object.fromEntries(configuredGates(deviceGates).map((name) => {
     const reading = GATES[name].derive?.(previous[name], sample[name] ?? {}) ?? sample[name] ?? {};
-    return [name, { reason: gateViolation(name, gateConfigOf(name, deviceGates), reading), reading, thresholds: gateConfigOf(name, deviceGates) }];
+    const fresh = gateViolation(name, gateConfigOf(name, deviceGates), reading);
+    const held = typeof recorded[name]?.closed === 'boolean' ? recorded[name].closed : null;
+    return [name, { reason: held === null ? fresh : held ? fresh ?? name : null, reading, thresholds: gateConfigOf(name, deviceGates) }];
   }));
 }
 
@@ -269,13 +340,20 @@ const GATE_PARTS = {
     ];
     return parts.some(Boolean) ? parts : ['readings unknown'];
   },
+  load: ({ load5PerCore, busyFraction }, t) => [
+    `load5/core ${show(load5PerCore, (v) => v.toFixed(2))}/≤${t.maxLoadPerCore}`,
+    `busy ${show(busyFraction, (v) => `${Math.round(v * 100)}%`)}/≥${Math.round(t.minBusyFraction * 100)}%`,
+  ],
   power: ({ onAc, batteryPercent }, t) => [
     show(onAc, (v) => (v ? 'AC' : 'on battery')),
     t.minBatteryPercent !== undefined && `battery ${show(batteryPercent, (v) => `${v}%`)}`,
   ],
 };
 
+// PKG-440: the default-on load gate is left out while it is open with no reading (a host the agent has not sampled), so the line names only gates with something to say.
+const silent = (name, { reason, reading }) => name === 'load' && !reason && !known(reading?.load5PerCore) && !known(reading?.busyFraction);
+
 export function renderDeviceGatesLine(live) {
-  const gates = Object.entries(live).map(([name, { reason, reading, thresholds }]) => `${name} ${reason ? 'CLOSED' : 'ok'} (${GATE_PARTS[name](reading, thresholds).filter(Boolean).join(', ')})`);
-  return `device gates: ${gates.join(' · ')}`;
+  const gates = Object.entries(live).filter(([name, state]) => !silent(name, state)).map(([name, { reason, reading, thresholds }]) => `${name} ${reason ? 'CLOSED' : 'ok'} (${GATE_PARTS[name](reading, thresholds).filter(Boolean).join(', ')})`);
+  return gates.length ? `device gates: ${gates.join(' · ')}` : null;
 }

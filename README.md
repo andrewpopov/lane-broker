@@ -331,7 +331,7 @@ blocks a start — not for an idle broker, not for one already holding
 non-conflicting leases. Set `true` to make a closed gate hard-deny again
 (pre-BRAIN-207 behaviour, including the BRAIN-197 idle exemption).
 
-`deviceGates` (BRAIN-1088, optional; absent means only the default `memory` gate): worker-side limits on device state. While a gate is closed the pull
+`deviceGates` (BRAIN-1088, optional; absent means only the default `memory` and `load` gates): worker-side limits on device state. While a gate is closed the pull
 agent (`lane agent`) takes no new claim; running work continues, and `status.json` shows `claims: paused:thermal`, `paused:on-battery`
 or `paused:battery-low`. Every gate and every threshold is optional, a gate needs at least one, and unknown keys are refused.
 `thermal` takes `maxPressureLevel` (0-4; macOS `notifyutil -g com.apple.system.thermalpressurelevel`), `minCpuSpeedLimit` (1-100;
@@ -346,8 +346,8 @@ parse failure or a failed sample leaves an open gate open and shows as `unknown`
 judge by (no configured reading known; for `power`, AC state unknown): it neither reopens nor loses its countdown, so editing a
 closed gate down to thresholds this platform cannot read holds it closed until a restart or until `deviceGates` is removed. Linux battery
 and thermal reads skip unreadable entries and `scope: Device` batteries (a wireless mouse), so a missing file is never read as 0. `lane status` samples live and prints one `device gates:` line; the agent's `status.json` carries each gate's
-`{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power|memory"}` (0/1, active
-gates only).
+`{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power|memory|load"}` (0/1, active
+gates only; the raw gate state, so a closed `load` gate reads 1 even while an idle runner still claims).
 
 **The `memory` gate (PKG-404) is on by default**; `"memory": false` turns it off (and clears local admission's stored state), and
 `"memory": {}` or any subset of its keys keeps the defaults for the rest. It closes only on signs the host is paging now, never on how
@@ -374,11 +374,28 @@ lease, like the load gate, so a paging host runs one lane at a time rather than 
 `lane status` adds a `memory gate: CLOSED` line while it is closed, and its `device gates:` line shows the live rate against the stored
 sample. macOS `critical` still denies every start, idle or not (`memory-critical`, BRAIN-207).
 
+**The `load` gate (PKG-440) is on by default**; `"load": false` turns it off and `"load": {}` or any subset of its keys keeps the defaults
+for the rest. Pull runners stop claiming while the host is genuinely overloaded (zirkbot reached load 29.6 on 12 logical cores with 4 lanes;
+workbook-pro ran an 8-slot runner at load 23 on 12 cores and merge-train's suite took 2 h against a 36-minute median). **Load average alone
+misleads** (Linux counts uninterruptible I/O waiters: zirkbot showed load 16 at 56% idle, workbook-pro load 35 at 0.5% idle), so the gate
+closes only when BOTH signals hold: the 5-minute load average per logical core (`os.loadavg()[1] / os.cpus().length`) exceeds
+`maxLoadPerCore` (0.1-100, default 1.2) AND the host's busy fraction is at least `minBusyFraction` (0.01-1, default 0.85), measured as busy delta over total delta across every logical CPU between two whole-host snapshots about 250 ms apart, uncapped by any cgroup limit. On Linux the snapshots are the aggregate `cpu` line of `/proc/stat` with iowait and steal counted as not busy (so an I/O-bound window reads low), elsewhere `os.cpus()`. A reading that is
+unavailable never violates, and like `memory` a closed load gate reopens and reports `sensor-unavailable` after 3 samples missing a signal.
+`openSamples` defaults to 3. **Idle exemption:** a runner with no non-terminal execution is never blocked by the load gate, so a runner
+always keeps at least one lane ("nothing should ever hold the machine"; a held agent reserves nothing in the queue, and a ticket only this
+runner may take would otherwise wait forever); `memory` still blocks when idle. **One claim per tick:** while the load per core is above
+80% of `maxLoadPerCore` (the load average lags by about 3.5 minutes and cannot see this tick's own claims) a claim round takes at most one
+ticket. The pull agent shows `claims: paused:load`, and `lane status` shows the gate with its readings even while open
+(`load ok (load5/core 0.90/≤1.2, busy 50%/≥85%)`). **WSL caveat:** on WSL (wintop, skybox) the loadavg and CPU counters describe only the VM,
+not the Windows host it shares, so the gate sees VM-local overload only. It is separate from `admissionLoadGate`, the local scheduler's
+absolute 1-minute load gate, which never reaches the pull agent.
+
 ```json
 "deviceGates": {
   "thermal": { "maxPressureLevel": 1, "minCpuSpeedLimit": 100, "maxTempC": 90, "openSamples": 3 },
   "power":   { "requireAc": true, "minBatteryPercent": 20, "openSamples": 1 },
-  "memory":  { "maxVmPressureLevel": 1, "maxPsiSomeAvg10": 10, "maxSwapMiBPerSec": 10, "openSamples": 3 }
+  "memory":  { "maxVmPressureLevel": 1, "maxPsiSomeAvg10": 10, "maxSwapMiBPerSec": 10, "openSamples": 3 },
+  "load":    { "maxLoadPerCore": 1.2, "minBusyFraction": 0.85, "openSamples": 3 }
 }
 ```
 

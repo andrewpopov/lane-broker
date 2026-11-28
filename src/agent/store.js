@@ -84,6 +84,13 @@ export function writeStatus(remoteRoot, status) {
   atomicWriteJson(agentPaths(remoteRoot).status, { pid: process.pid, at: Date.now(), ...status });
 }
 
+// The live owner's own record only: a status.json left by a previous agent (pid differs) is not this agent's view.
+export function readCurrentAgentGates(remoteRoot) {
+  const { owner, live } = readOwner(remoteRoot);
+  const status = live ? readJsonSafe(agentPaths(remoteRoot).status) : null;
+  return status && owner && status.pid === owner.pid ? status.deviceGates ?? null : null;
+}
+
 export function readAgentStatus(remoteRoot) {
   const { live } = readOwner(remoteRoot);
   return live ? { state: 'running', ...readJsonSafe(agentPaths(remoteRoot).status) } : { state: 'no-owner' };

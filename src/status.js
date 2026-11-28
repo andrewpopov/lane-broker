@@ -22,6 +22,7 @@ import { resolveCpuLimit, enforcementOf } from './cpu-limit.js';
 import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
 import { defaultRemoteRoot } from './remote-runner.js';
+import { readAgentStatus, readCurrentAgentGates } from './agent/store.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { readTicketWait, waitLabel } from './ticket-wait.js';
@@ -192,7 +193,13 @@ const countJsonFiles = (dir) => {
   }
 };
 
-export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot(), sampleDeviceGates = false } = {}) {
+async function liveStatusGates(deviceGates, root, remoteRoot, sampleGates) {
+  const recorded = readCurrentAgentGates(remoteRoot);
+  const cpuLoad = async () => recorded?.load?.reading ?? null;
+  return { deviceGates: liveDeviceGates(deviceGates, await sampleGates(deviceGates, { cpuLoad }), { memory: readMemoryGate(root, deviceGates).reading }, { load: recorded?.load }) };
+}
+
+export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot(), sampleDeviceGates = false, sampleGates = sampleDevice } = {}) {
   const root = ensureStateDirs().root;
   const { config: cfg, error: configError } = loadGlobalConfigOrError();
   refreshCpuEstimates(cfg);
@@ -416,7 +423,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     // null whenever the sample itself is unavailable (non-macOS host, or a
     // failed probe), never a fabricated reading.
     memory: classifyMemorySample(readMemorySample()),
-    ...(sampleDeviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates), { memory: readMemoryGate(root, cfg.deviceGates).reading }) } : {}),
+    // PKG-440: status never opens a CPU sampling window (a 250 ms sleep on every call); the load gate shows the running agent's own recorded reading.
+    ...(sampleDeviceGates ? await liveStatusGates(cfg.deviceGates, root, remoteRoot, sampleGates) : {}),
     memoryGate: readMemoryGate(root, cfg.deviceGates),
     running,
     queued,
@@ -652,7 +660,8 @@ export function renderStatusText(status) {
     );
   }
   lines.push(renderMemoryLine(status.memory));
-  if (status.deviceGates) lines.push(renderDeviceGatesLine(status.deviceGates));
+  const gatesLine = status.deviceGates ? renderDeviceGatesLine(status.deviceGates) : null;
+  if (gatesLine) lines.push(gatesLine);
   if (status.memoryGate?.closed) lines.push(renderMemoryGateLine(status.memoryGate));
   if (status.priority && !status.priority.active) {
     lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');

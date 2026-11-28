@@ -39,6 +39,7 @@ function scriptedSampler() {
   return { sampler, feed, asked, releaseAll: () => waiting.splice(0).forEach((resolve) => resolve({})) };
 }
 
+const SLEEPS = 'setTimeout(() => {}, 120000)';
 const SCHEDULE = { timezone: 'UTC', available: [{ days: ['mon'], from: '09:00', to: '10:00' }] };
 const MONDAY = (hh, mm) => Date.UTC(2026, 10, 16, hh, mm);
 
@@ -232,6 +233,42 @@ const scenarios = {
     }
   },
 
+  'a hot busy host: an idle runner still claims one ticket, then takes no more while it runs one, and resumes after openSamples clean samples': async (w, rw, load) => {
+    const reading = { load5PerCore: 2.5, busyFraction: 0.95 };
+    let cleanSamples = 0;
+    const deviceSampler = async () => {
+      if (reading.busyFraction < 0.5) cleanSamples += 1;
+      return { thermal: {}, power: {}, memory: {}, load: { ...reading } };
+    };
+    const deviceGates = { memory: false, load: { openSamples: 3 } };
+    brokerGates(rw, deviceGates);
+    const [first, second] = [await rw.submit({ code: SLEEPS }), await rw.submit({ code: SLEEPS })];
+    await rw.agent({ load, deviceSampler, config: { deviceGates } });
+    const gate = () => readAgentStatus(rw.root).deviceGates?.load;
+    await rw.claimed(first);
+    await happens('the load gate is closed and the status says why', () => gate()?.closed === true && readAgentStatus(rw.root).claims === 'paused:load');
+    assert.deepEqual([gate().reading.load5PerCore, gate().reading.busyFraction], [2.5, 0.95]);
+    await sleep(500);
+    assert.equal((await w.ticket(second.id)).epoch, 0, 'one execution is running, so the hot host takes no more');
+    Object.assign(reading, { load5PerCore: 0.3, busyFraction: 0.2 });
+    await rw.claimed(second);
+    assert.ok(cleanSamples >= 3, `the gate reopened after ${cleanSamples} clean samples, not 3`);
+    await happens('the gate shows open', () => gate()?.closed === false);
+  },
+
+  'near the load limit the claim round takes one ticket per tick': async (w, rw, load) => {
+    const reading = { load5PerCore: 1.0, busyFraction: 0.5 };
+    const deviceSampler = async () => ({ thermal: {}, power: {}, memory: {}, load: { ...reading } });
+    const tickets = [];
+    for (let i = 0; i < 2; i += 1) tickets.push(await rw.submit({ code: SLEEPS }));
+    const claimedCount = async () => (await Promise.all(tickets.map((t) => w.ticket(t.id)))).filter((row) => row.epoch > 0).length;
+    await rw.agent({ load, deviceSampler, config: { pollMs: 1500, deviceGates: { memory: false } } });
+    await happens('the first claim', async () => (await claimedCount()) >= 1);
+    await sleep(1300); // pollMs 1500 less the slack of noticing the first claim: a NOTIFY-woken tick must not claim again inside the window
+    assert.equal(await claimedCount(), 1, 'load 1.0 per core is within 0.8 of the 1.2 limit: one claim per pollMs');
+    await happens('the next tick claims the second', async () => (await claimedCount()) === 2, 30_000);
+  },
+
   'the schedule window is respected: outside it, or too close to its close, no ld_claim is made': async (w, rw, load) => {
     const { claimBlock, claimOnce } = await load('agent/claims.js');
     const block = (now) => claimBlock({ schedule: SCHEDULE, stopClaimingBeforeCloseMs: 30 * 60_000, now, draining: () => false });
@@ -252,10 +289,15 @@ const CLAIMS = 'agent/claims.js';
 const gateName = 'a closed thermal gate takes no claim and shows paused:thermal; it reopens only after openSamples clean samples, then the claim goes through';
 const holdName = 'a closed thermal gate holds while the sampler fails or reads nothing: status stays paused:thermal and the countdown does not move';
 const liveName = 'thresholds are re-read from the broker config on each sample: an edit restarts the countdown and leaves the gate closed';
+const hotName = 'a hot busy host: an idle runner still claims one ticket, then takes no more while it runs one, and resumes after openSamples clean samples';
 const canaries = [
+  [hotName, CLAIMS, ['return closedGateReason(deviceGates, { idle });', 'return closedGateReason(deviceGates);']],
+  [hotName, 'agent/run.js', ["idle: !core.table.all().some((r) => r.subphase !== 'DONE')", 'idle: true']],
+  [hotName, 'device-gates.js', ['if (state.consecutiveOk >= openSamples) {', 'if (state.consecutiveOk >= 1) {']],
+  ['near the load limit the claim round takes one ticket per tick', 'agent/run.js', ['      if (loadApproaching(deviceGates, deviceGatesConfig) && now() - hotClaimAt < config.pollMs) return;\n', '']],
   [holdName, 'device-gates.js', ['state.closed && GATES[name].informative(gateCfg, reading)', 'state.closed']],
   [liveName, 'agent/run.js', ['    reloadDeviceGatesConfig();\n    let sample', '    let sample']],
-  [gateName, CLAIMS, ['return closedGateReason(deviceGates);', 'return null;']],
+  [gateName, CLAIMS, ['return closedGateReason(deviceGates, { idle });', 'return null;']],
   [gateName, 'agent/run.js', ['        await refreshDeviceGates();\n', '']],
   [gateName, 'device-gates.js', ['if (state.consecutiveOk >= openSamples) {', 'if (state.consecutiveOk >= 1) {']],
   ['the req is persisted before ld_claim is called, and a claimed answer leaves a FETCHING record and no pending req', CLAIMS, ['if (!pending) writePendingClaim(remoteRoot, req);', '']],
