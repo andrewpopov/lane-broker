@@ -170,14 +170,14 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
     await c.query("INSERT INTO lane.principals (login_role, kind, allowed_accounts) VALUES ('old_submit', 'submit', '{a1,a2}')");
     assert.equal((await c.query('SELECT count(*)::int AS n FROM lane.sched_parents')).rows[0].n, 0);
     const r = await applyMigrations(c);
-    assert.equal(r.applied.length, 10);                // 003 (the backfill), 004 to 012
+    assert.equal(r.applied.length, 11);                // 003 (the backfill), 004 to 013
     assert.deepEqual((await c.query('SELECT account, count(*)::int AS n FROM lane.sched_parents GROUP BY account ORDER BY account')).rows, [{ account: 'a1', n: 5 }, { account: 'a2', n: 5 }]);
   });
 
   test('migration 012 adds host:<host> to the tags of agent principals that already existed, keeping their own tags', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
-    fs.rmSync(path.join(dir, 'migrations', '012-host-identity-tag.sql'));
+    for (const f of ['012-host-identity-tag.sql', '013-dispatch-key.sql']) fs.rmSync(path.join(dir, 'migrations', f));
     await applyMigrations(c, { dir });
     await c.query("INSERT INTO lane_dispatch.principals (login_role, host, kind, tags, allowed_repos) VALUES ('lane_agent_old', 'old', 'agent', '{linux,host:other}', '{*}'), ('lane_submit_old', NULL, 'submit', '{}', '{}')");
     await applyMigrations(c);
