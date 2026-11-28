@@ -9,3 +9,5 @@ process.env.LANE_BROKER_TEST_MEMORY_PRESSURE ??= ',,';
 
 // A runner lane exports its own LOCAL/EXECUTOR/RUNNER vars; in-process runCommand tests must not inherit them.
 for (const key of INHERITED_BROKER_VARS) delete process.env[key];
+
+for (const key of Object.keys(process.env)) if (key.startsWith('BOSUN_')) delete process.env[key];
