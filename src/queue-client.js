@@ -24,7 +24,7 @@ const FUNCTIONS = {
   ld_withdraw: { types: ['uuid'], idempotent: false },
   ld_cancel: { types: ['uuid'], idempotent: false },
   ld_placeable: { types: ['text', 'text[]', 'text'], idempotent: true },
-  ld_placeable_detail: { types: ['text', 'text[]'], idempotent: true },
+  ld_placeable_detail: { types: ['text', 'text[]', 'text'], idempotent: true },
   // lane_admin only (`lane pull gc`); every one is safe to send again
   ld_prune_candidates: { types: ['interval', 'interval', 'timestamptz', 'uuid', 'int'], idempotent: true },
   ld_prune: { types: ['uuid[]', 'interval'], idempotent: true },
@@ -123,6 +123,15 @@ export function createQueueClient({
     }
   }
 
+  async function withTwoArgFallback(name, repoKey, requiresTags, repoName, options) {
+    try {
+      return await invoke(name, [repoKey, requiresTags, repoName ?? null], options);
+    } catch (err) {
+      if (err.code !== UNDEFINED_FUNCTION) throw err;
+      return invoke(name, [repoKey, requiresTags], options);
+    }
+  }
+
   return {
         queueRef: (options) => invoke('ld_queue_ref', [], options),
 
@@ -143,16 +152,9 @@ export function createQueueClient({
 
         cancel: (id) => invoke('ld_cancel', [id]),
 
-        placeable: async (repoKey, requiresTags, repoName, options) => {
-      try {
-        return await invoke('ld_placeable', [repoKey, requiresTags, repoName ?? null], options);
-      } catch (err) {
-        if (err.code !== UNDEFINED_FUNCTION) throw err;
-        return invoke('ld_placeable', [repoKey, requiresTags], options);
-      }
-    },
+        placeable: (repoKey, requiresTags, repoName, options) => withTwoArgFallback('ld_placeable', repoKey, requiresTags, repoName, options),
 
-        placeableDetail: (repoKey, requiresTags, options) => invoke('ld_placeable_detail', [repoKey, requiresTags], options),
+        placeableDetail: (repoKey, requiresTags, repoName, options) => withTwoArgFallback('ld_placeable_detail', repoKey, requiresTags, repoName, options),
 
         pruneCandidates: ({ objectsAfterMs, rowsAfterMs, after = null, limit = 200 }) =>
       invoke('ld_prune_candidates', [intervalOf(objectsAfterMs), intervalOf(rowsAfterMs), after?.finished_at ?? null, after?.id ?? null, limit]),

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { createQueueClient, QueueError } from '../src/queue-client.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, claim, start, openRepoMode, tid, downgradeToV6, downgradeToV8, downgradeToV11 } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, claim, start, openRepoMode, tid, downgradeToV6, downgradeToV8, downgradeToV12 } from './lane-dispatch-fixture.js';
 import { CA_TEXT, QUEUE_URL, harnessClient, secretFiles } from './helpers/queue-fixture.js';
 
 /** BRAIN-1036 R4: the submitter queue client against a disposable Postgres. */
@@ -98,7 +98,7 @@ const SCENARIOS = {
   },
 
   'a queue from before the 3-argument ld_placeable answers the 2-argument call, which still sends the repo key': async (w, t, createClient) => {
-    await downgradeToV11(w);
+    await downgradeToV12(w);
     const sent = [];
     const { queue } = harnessClient(t, w, {
       createClient,
@@ -112,6 +112,29 @@ const SCENARIOS = {
     assert.deepEqual(sent.map(([sql]) => sql.match(/ld_placeable\((.*)\)/)[1]), ['$1::text, $2::text[], $3::text', '$1::text, $2::text[]']);
     assert.deepEqual(sent.map(([, values]) => values), [['repoA', ['fast'], 'popovlabs/towerpower'], ['repoA', ['fast']]]);
     assert.equal(await queue.placeable('repoA', []), 3);
+  },
+
+  'placeableDetail sends the repo name to the 3-argument function, and an unnamed caller is scored as adhoc': async (w, t, createClient) => {
+    const { queue } = harnessClient(t, w, { createClient });
+    assert.equal((await queue.placeableDetail('repoA', [], 'repoA')).eligible, 3, 'a1 lists repoA, a2 and x are open');
+    assert.equal((await queue.placeableDetail('repoA', [], 'other/repo')).eligible, 2, 'a1 is enforce and does not list it');
+    assert.equal((await queue.placeableDetail('repoA', [])).eligible, 2, 'no name scores as adhoc');
+  },
+
+  'a queue from before the 3-argument ld_placeable_detail answers the 2-argument call, which still sends the repo key': async (w, t, createClient) => {
+    await downgradeToV12(w);
+    const sent = [];
+    const { queue } = harnessClient(t, w, {
+      createClient,
+      onConnect: (client) => {
+        const query = client.query.bind(client);
+        client.query = (sql, values) => { sent.push([sql, values]); return query(sql, values); };
+      },
+    });
+    const detail = await queue.placeableDetail('repoA', ['fast'], 'popovlabs/towerpower').catch((err) => assert.fail(`the 2-argument fallback was not taken: ${err.message}`));
+    assert.equal(detail.eligible, 1);
+    assert.deepEqual(sent.map(([sql]) => sql.match(/ld_placeable_detail\((.*)\)/)[1]), ['$1::text, $2::text[], $3::text', '$1::text, $2::text[]']);
+    assert.deepEqual(sent.map(([, values]) => values), [['repoA', ['fast'], 'popovlabs/towerpower'], ['repoA', ['fast']]]);
   },
 
   'enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1': async (w, t, createClient) => {
@@ -230,9 +253,11 @@ const SCENARIOS = {
 };
 
 const CANARIES = [
+  ['a queue from before the 3-argument ld_placeable_detail answers the 2-argument call, which still sends the repo key', ["withTwoArgFallback('ld_placeable_detail', repoKey, requiresTags, repoName, options)", "invoke('ld_placeable_detail', [repoKey, requiresTags, repoName ?? null], options)"]],
+  ['placeableDetail sends the repo name to the 3-argument function, and an unnamed caller is scored as adhoc', ["withTwoArgFallback('ld_placeable_detail', repoKey, requiresTags, repoName, options)", "withTwoArgFallback('ld_placeable_detail', repoKey, requiresTags, undefined, options)"]],
   ['a queue from before the 3-argument ld_placeable answers the 2-argument call, which still sends the repo key', ['if (err.code !== UNDEFINED_FUNCTION) throw err;', 'throw err;']],
-  ['a queue from before the 3-argument ld_placeable answers the 2-argument call, which still sends the repo key', ["return invoke('ld_placeable', [repoKey, requiresTags], options);", "return invoke('ld_placeable', [repoName, requiresTags], options);"]],
-  ['placeable sends the repo name to the 3-argument function: an enforce host counts only for a repo it lists, and a caller with no name is scored as adhoc', ["[repoKey, requiresTags, repoName ?? null], options);", "[repoKey, requiresTags, null], options);"]],
+  ['a queue from before the 3-argument ld_placeable answers the 2-argument call, which still sends the repo key', ["return invoke(name, [repoKey, requiresTags], options);", "return invoke(name, [repoName, requiresTags], options);"]],
+  ['placeable sends the repo name to the 3-argument function: an enforce host counts only for a repo it lists, and a caller with no name is scored as adhoc', ["await invoke(name, [repoKey, requiresTags, repoName ?? null], options)", "await invoke(name, [repoKey, requiresTags, null], options)"]],
   ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol,', 'priority, 1,']],
   ['a queue still at schema version 6 accepts an enqueue from this client that sets no avoidTags, and refuses one that does with the missing function', ['avoidTags.length > 0 ? [true, null, null, avoidTags] : [];', '[true, null, null, avoidTags];']],
   ['enqueueFenced carries the lane requires to the row, and a caller that names none requires nothing (BRAIN-1135)', [': requires.length > 0 ? [true, null, null, avoidTags, requires]', ': requires.length > 0 ? [true, null, null, avoidTags]']],

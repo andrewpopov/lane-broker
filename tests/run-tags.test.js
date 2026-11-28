@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { runTagFromFlag, noOnlineRunnerMessage, checkRunnable, RUNNER_ONLINE_WITHIN_S } from '../src/run-tags.js';
 import { effectiveRequiresTags, hostTag, isValidRunTag } from '../src/runner-readiness.js';
 import { computeContentKey, settledContentKey } from '../src/result-cache.js';
@@ -17,14 +18,14 @@ const PULL_CFG = {
   laneQueueUrl: 'postgres://u@h/db',
   runners: [{ name: 'pullbox', ssh: 'x', transport: 'pull' }],
 };
-const servicesAnswering = (answer, { count } = {}) => () => ({
+const servicesAnswering = (answer, { count, probed } = {}) => () => ({
   available: true,
   queue: {
-    placeableDetail: async () => (answer instanceof Error ? Promise.reject(answer) : answer),
-    placeable: async () => (count instanceof Error ? Promise.reject(count) : count),
+    placeableDetail: async (repoKey, tags, repoName) => { probed?.push(['detail', repoKey, repoName]); return answer instanceof Error ? Promise.reject(answer) : answer; },
+    placeable: async (repoKey, tags, repoName) => { probed?.push(['placeable', repoKey, repoName]); return count instanceof Error ? Promise.reject(count) : count; },
   },
 });
-const checkWith = (answer, tags = [hostTag('evo-x2')], cfg = PULL_CFG, opts) => checkRunnable({ cfg, root: '/r', repoKey: 'rouge', tags, servicesFor: servicesAnswering(answer, opts) });
+const checkWith = (answer, tags = [hostTag('evo-x2')], cfg = PULL_CFG, opts) => checkRunnable({ cfg, root: '/r', repoKey: 'rouge', repoName: 'popovlabs/rouge', tags, servicesFor: servicesAnswering(answer, opts) });
 
 test('--runner is shorthand for --tag host:<name>; --tag takes plain and host: tags and refuses a malformed one', () => {
   assert.equal(runTagFromFlag('--runner', 'evo-x2'), 'host:evo-x2');
@@ -62,6 +63,21 @@ test('checkRunnable refuses from the queue answer, and never blocks a run when t
   const noPull = { ...PULL_CFG, lanePull: { enabled: false } };
   assert.match((await checkWith(offline, [hostTag('x')], noPull)).message, /does not use pull dispatch/, 'a pin without pull dispatch has nowhere to go');
   assert.deepEqual(await checkWith(offline, ['browser'], noPull), { ok: true }, 'a plain tag is not blocked');
+});
+
+const NAME_SCENARIO = async (load) => {
+  const { checkRunnable: check } = await load('run-tags.js');
+  const probed = [];
+  const run = (answer, count) => check({ cfg: PULL_CFG, root: '/r', repoKey: 'rouge', repoName: 'popovlabs/rouge', tags: ['host:evo-x2'], servicesFor: servicesAnswering(answer, { count, probed }) });
+  await run({ eligible: 1, runners: [{ host: 'evo-x2', seenAgoS: 3 }] });
+  await run(new Error('function ld_placeable_detail does not exist'), 1);
+  assert.deepEqual(probed, [['detail', 'rouge', 'popovlabs/rouge'], ['detail', 'rouge', 'popovlabs/rouge'], ['placeable', 'rouge', 'popovlabs/rouge']]);
+};
+
+test('the ticket\'s repo name reaches the detail probe and the placeable fallback, so an enforce runner is judged on the repo', async () => {
+  await NAME_SCENARIO(realSrc);
+  await assertCanaryFails('run-tags.js', ['placeableDetail(repoKey, tags, repoName, QUEUE_PROBE)', 'placeableDetail(repoKey, tags, undefined, QUEUE_PROBE)'], NAME_SCENARIO);
+  await assertCanaryFails('run-tags.js', ['placeable(repoKey, tags, repoName, QUEUE_PROBE)', 'placeable(repoKey, tags, undefined, QUEUE_PROBE)'], NAME_SCENARIO);
 });
 
 test('the same content aimed at another machine is not the same run: required tags are part of the content key, none leaves it unchanged', () => {

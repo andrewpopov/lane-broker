@@ -334,7 +334,7 @@ const NOT_PREPARED = 'a snapshot upload that fails permanently before anything i
 
 const STAMPED_HEADER = 'a pull ticket carries the canonical repo name of the checkout\'s origin and the submitter\'s broker version in its header';
 const CANARIES = [
-  [STAMPED_HEADER, 'run.js', ['repoName: repoName(originUrlOf(remoteWorktreeRoot), { baseDir: remoteWorktreeRoot }),', "repoName: 'adhoc',"]],
+  [STAMPED_HEADER, 'run.js', ['      repoName: submitRepoName,\n      weight', "      repoName: 'adhoc',\n      weight"]],
   [STAMPED_HEADER, 'repo-name.js', ['brokerVersion: BROKER_VERSION }', '}']],
   ['after a cancel the supervisor keeps polling at its own pace: a held ticket whose runner has not yet answered is not stepped in a busy loop', ...pullTicket('  const timer = setTimeout(done, ms);\n  signal?.addEventListener', '  if (signal?.aborted) return resolve();\n  const timer = setTimeout(done, ms);\n  signal?.addEventListener')],
   [RECOVERED_SWEEP, 'pull-services.js', ['    ...publicationBindingsFor(root, id),\n', '']],
