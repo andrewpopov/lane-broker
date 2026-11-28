@@ -811,7 +811,8 @@ test('--apply re-runs under flock -n with a conflict exit, and runCli refuses an
 
 test('flock(1) refuses a second holder with the conflict exit and frees the lock when its holder dies', { skip: spawnSync('flock', ['-h']).error ? 'flock not installed' : false }, () => {
   const file = path.join(makeTmpDir('runner-admin-flock-'), 'evo-x2.lock');
-  const holder = spawn('flock', ['-n', file, 'sleep', '30'], { stdio: 'ignore', detached: true });
+  // The holder blocks: with -n it could lose the race to a probe below, give up, and leave the lock free for good.
+  const holder = spawn('flock', [file, 'sleep', '30'], { stdio: 'ignore', detached: true });
   const deadline = Date.now() + 5000;
   let second;
   do { second = spawnSync('flock', ['-n', '-E', String(lib.LOCK_CONFLICT_EXIT), file, 'true']); } while (second.status === 0 && Date.now() < deadline);
