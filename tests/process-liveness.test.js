@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { isPidAlive, isProcessAlive, processStartTime, procStatState } from '../src/process-liveness.js';
+import { isConfirmedGone, isPidAlive, isProcessAlive, isVerifiedProcess, processStartTime, procStatState, psStartTime, sameProcessStart } from '../src/process-liveness.js';
 import { makeTmpDir } from './helpers/tmp.js';
 
 function withFailingPs(t, fn) {
@@ -20,7 +20,8 @@ function withFailingPs(t, fn) {
 
 test('a live pid whose ps exits non-zero is still alive: ps alone cannot declare it dead', (t) => {
   withFailingPs(t, () => {
-    assert.equal(processStartTime(process.pid), null);
+    if (process.platform === 'linux') assert.match(processStartTime(process.pid), /^ticks:\d+$/, 'Linux reads /proc, not ps');
+    else assert.equal(processStartTime(process.pid), null);
     assert.equal(isProcessAlive(process.pid, 'Mon Jan  1 00:00:00 2024'), true);
   });
 });
@@ -70,9 +71,45 @@ test('a stuck ps that ignores SIGTERM is killed at the timeout and reads as inde
   process.env.PATH = `${bin}${path.delimiter}${saved}`;
   try {
     const started = Date.now();
-    assert.equal(processStartTime(process.pid, { timeoutMs: 200 }), undefined);
+    assert.equal(psStartTime(process.pid, { timeoutMs: 200 }), undefined);
     assert.ok(Date.now() - started < 5_000, 'the probe ended at its timeout');
   } finally {
     process.env.PATH = saved;
   }
+});
+
+function withPsPrinting(t, line, fn) {
+  const bin = makeTmpDir('lane-ps-print-', t);
+  fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh\necho '${line}'\n`, { mode: 0o755 });
+  const saved = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${saved}`;
+  try {
+    return fn();
+  } finally {
+    process.env.PATH = saved;
+  }
+}
+
+test('a ps start token is still compared exactly: one second off is a different process', (t) => {
+  const recorded = 'Tue Nov 24 14:30:17 2026';
+  withPsPrinting(t, recorded, () => assert.equal(sameProcessStart(process.pid, recorded), true));
+  withPsPrinting(t, 'Tue Nov 24 14:30:16 2026', () => assert.equal(sameProcessStart(process.pid, recorded), false));
+});
+
+test('a ticks token whose /proc read fails is indeterminate, never a mismatch', { skip: process.platform !== 'linux' }, () => {
+  assert.equal(sameProcessStart(2 ** 22 + 12345, 'ticks:1'), null, 'a pid with no /proc entry is gone');
+  assert.equal(isVerifiedProcess(process.pid, processStartTime(process.pid)), true);
+  assert.equal(isConfirmedGone(process.pid, processStartTime(process.pid)), false);
+  assert.equal(isConfirmedGone(process.pid, 'ticks:1'), true, 'a different tick count is a different process');
+});
+
+test('on Linux the start token comes from /proc and ignores whatever ps reports', { skip: process.platform !== 'linux' }, (t) => {
+  const token = processStartTime(process.pid);
+  assert.match(token, /^ticks:\d+$/);
+  assert.equal(token.slice(6), fs.readFileSync('/proc/self/stat', 'utf8').slice(fs.readFileSync('/proc/self/stat', 'utf8').lastIndexOf(')') + 2).split(' ')[19]);
+  withPsPrinting(t, 'Mon Jan  1 00:00:00 2000', () => {
+    assert.equal(processStartTime(process.pid), token);
+    assert.equal(isProcessAlive(process.pid, token), true);
+  });
+  assert.equal(isProcessAlive(process.pid, 'ticks:1'), false, 'a different tick count is pid reuse');
 });

@@ -4,7 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFileSync } from 'node:child_process';
-import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
+import { isPidAlive, processStartTime, isProcessAlive, sameProcessStart } from './process-liveness.js';
 
 export { isPidAlive, processStartTime };
 
@@ -755,10 +755,10 @@ function isLockOwnerAlive(owner) {
   if (!owner || owner.unreadable) return false;
   if (!isPidAlive(owner.pid)) return false;
   if (!owner.start) return true; // couldn't capture a start time at acquire time; fall back to pid-alive
-  const current = processStartTime(owner.pid);
-  if (current === undefined) return true; // probe failed: fail closed, never steal
-  if (current === null) return isPidAlive(owner.pid); // `ps` alone cannot declare a pid that kill(0) just saw alive dead
-  return current === owner.start;
+  const same = sameProcessStart(owner.pid, owner.start);
+  if (same === undefined) return true; // probe failed: fail closed, never steal
+  if (same === null) return isPidAlive(owner.pid); // the probe alone cannot declare a pid that kill(0) just saw alive dead
+  return same;
 }
 
 /**

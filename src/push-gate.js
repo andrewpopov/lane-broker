@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isCancelled, readSupersededBy } from './state.js';
 import { LEASE_STATE } from './lease.js';
+import { processStartTime } from './process-liveness.js';
 
 const MAX_HOPS = 8;
 const PS_LINE = /^\s*(\d+)\s+(\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d \d{4})\s+(.*)$/;
@@ -59,10 +60,10 @@ export function detectPushGate({ cwd = process.cwd(), env = process.env, ppid = 
         if (!worktree || !branch || !Number.isFinite(gitStartEpoch)) return null;
         return {
           gitPid: pid,
-          gitStart: row.start,
+          gitStart: processStartTime(pid) ?? null,
           gitStartEpoch,
           clientPid: process.pid,
-          clientStart: psRow(process.pid).start,
+          clientStart: processStartTime(process.pid) ?? null,
           caller: callerOf(worktree, env),
           worktree,
           branch,

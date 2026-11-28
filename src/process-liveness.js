@@ -28,13 +28,33 @@ export function isPidAlive(pid) {
 
 /**
  * Process start time, used to defeat PID reuse. Returns:
- *  - a string (the `ps` start-time line) if the process is alive,
+ *  - a string if the process is alive: `ticks:<n>` from /proc on Linux, else the `ps` start-time line,
  *  - `null` if `ps` ran and confirmed the pid does not exist,
  *  - `undefined` if the probe itself failed (e.g. cannot fork under load) —
  *    callers must treat this as "could not determine", never as "gone".
  * Pinned to the C locale so the output format is stable across environments.
  */
 export function processStartTime(pid, { timeoutMs = PS_TIMEOUT_MS } = {}) {
+  return process.platform === 'linux' ? procStartTicks(pid) : psStartTime(pid, { timeoutMs });
+}
+
+/** Linux: `/proc/<pid>/stat` field 22, the start time in clock ticks since boot. Unlike `ps -o lstart=`, which adds the
+ *  kernel's boot time and so moves whenever WSL or NTP steps the clock, it never changes for a live process.
+ *  `null` when the pid is gone, `undefined` when /proc cannot answer: never a `ps` string, so a token's format is fixed per platform. */
+export function procStartTicks(pid, readFile = fs.readFileSync) {
+  let stat;
+  try {
+    stat = readFile(`/proc/${pid}/stat`, 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT' || err.code === 'ESRCH' ? null : undefined;
+  }
+  const ticks = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+  return /^\d+$/.test(ticks ?? '') ? `${TICKS_PREFIX}${ticks}` : undefined;
+}
+
+const TICKS_PREFIX = 'ticks:';
+
+export function psStartTime(pid, { timeoutMs = PS_TIMEOUT_MS } = {}) {
   try {
     // A stuck ps is SIGKILLed at the timeout (it may ignore SIGTERM) and reads as indeterminate, so it never holds the event loop.
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
@@ -54,6 +74,15 @@ export function processStartTime(pid, { timeoutMs = PS_TIMEOUT_MS } = {}) {
   }
 }
 
+/** Does `recorded` still name the process now running as `pid`? `true`, `false`, `null` (the probe says the pid is gone) or
+ *  `undefined` (the probe could not answer). A `ticks:` token is read back from /proc; any other token is a `ps` string and is
+ *  compared exactly, as before: hosts upgrade drained, so no live process holds one on Linux. */
+export function sameProcessStart(pid, recorded) {
+  const current = String(recorded).startsWith(TICKS_PREFIX) ? procStartTicks(pid) : psStartTime(pid);
+  if (current === undefined || current === null) return current;
+  return current === recorded;
+}
+
 /**
  * Is the process that recorded `pid` and `startTime` still the one running? Fails closed: if the liveness probe itself
  * cannot be completed (e.g. `ps` cannot fork under load) the process counts as alive, so a transient probe failure
@@ -62,10 +91,10 @@ export function processStartTime(pid, { timeoutMs = PS_TIMEOUT_MS } = {}) {
 export function isProcessAlive(pid, startTime) {
   if (!isPidAlive(pid)) return false;
   if (!startTime) return true; // couldn't capture a start time at write time; fall back to pid-alive
-  const current = processStartTime(pid);
-  if (current === undefined) return true; // probe failed: fail closed
-  if (current === null) return isPidAlive(pid); // `ps` alone cannot declare a pid that kill(0) just saw alive dead
-  return current === startTime;
+  const same = sameProcessStart(pid, startTime);
+  if (same === undefined) return true; // probe failed: fail closed
+  if (same === null) return isPidAlive(pid); // the probe alone cannot declare a pid that kill(0) just saw alive dead
+  return same;
 }
 
 /**
@@ -74,14 +103,12 @@ export function isProcessAlive(pid, startTime) {
  */
 export function isVerifiedProcess(pid, startTime) {
   if (!startTime || !isPidAlive(pid)) return false;
-  const current = processStartTime(pid);
-  return typeof current === 'string' && current === startTime;
+  return sameProcessStart(pid, startTime) === true;
 }
 
-/** Positively gone: the pid no longer signals, or `ps` read a different start time for it. A failed probe, or no recorded start time, is not gone. */
+/** Positively gone: the pid no longer signals, or its readable start token differs from the recorded one. A failed probe, or no recorded start time, is not gone. */
 export function isConfirmedGone(pid, startTime) {
   if (!isPidAlive(pid)) return true;
   if (!startTime) return false;
-  const current = processStartTime(pid);
-  return typeof current === 'string' && current !== startTime;
+  return sameProcessStart(pid, startTime) === false;
 }
