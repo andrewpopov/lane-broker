@@ -143,6 +143,7 @@ function parseRunArgs(args) {
       case '--tag':
       case '--runner':
         opts.runTags = [...(opts.runTags ?? []), runTagFromFlag(a, flagArgs[++i])];
+        break;
       // Validated (exit 64) by runCommand.
       case '--deadline':
         opts.deadline = flagArgs[++i] ?? '';
