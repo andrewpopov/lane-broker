@@ -271,6 +271,7 @@ export const DEFAULT_GLOBAL_CONFIG = {
     localFallbackWhenUnreachable: false,
     localFallbackAfterMs: 600_000,
     blobGc: true,
+    budgetEnforce: false,
     blobRefreshAfterDays: 7,
     rowRetentionMs: 7 * 24 * 3_600_000,
     ledgerRetentionMs: 45 * 24 * 3_600_000,
@@ -628,6 +629,7 @@ function validateLanePull(cfg, sourcePath) {
   assert(isPlainObject(pull), `${sourcePath}: "lanePull" must be an object`);
   assert(typeof pull.enabled === 'boolean', `${sourcePath}: "lanePull.enabled" must be a boolean`);
   assert(typeof pull.blobGc === 'boolean', `${sourcePath}: "lanePull.blobGc" must be a boolean`);
+  assert(typeof pull.budgetEnforce === 'boolean', `${sourcePath}: "lanePull.budgetEnforce" must be a boolean`);
   assert(typeof pull.localFallbackWhenUnreachable === 'boolean', `${sourcePath}: "lanePull.localFallbackWhenUnreachable" must be a boolean`);
   for (const field of LANE_PULL_NUMBERS) assert(Number.isInteger(pull[field]) && pull[field] > 0, `${sourcePath}: "lanePull.${field}" must be a positive integer`);
   assert(pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS, `${sourcePath}: "lanePull.ledgerRetentionMs" must be at least ${LEDGER_RETENTION_FLOOR_MS} (35 days, the queue's backup retention)`);

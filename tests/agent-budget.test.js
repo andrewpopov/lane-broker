@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import test from 'node:test';
 import { MAX_USAGE_ROOTS, requestSocket } from '@andrewpopov/bosun/module';
 import { createFakeBudget } from '@andrewpopov/bosun/testing/budget';
-import { openBudgetShadow, rootsReader, standaloneBudget, USAGE_HEARTBEAT_MS } from '../src/agent/budget.js';
+import { capByGrant, openBudgetShadow, rootsReader, standaloneBudget, USAGE_HEARTBEAT_MS } from '../src/agent/budget.js';
 import { claimFigures } from '../src/agent/claims.js';
 import { renderAgentMetrics } from '../src/agent/metrics.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { waitFor } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { processStartTime, processStartTimes } from '../src/process-liveness.js';
+import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 
 const GIB = 1024 ** 3;
 const HOST = { cpuCores: 8, memoryBytes: 16 * GIB };
@@ -30,10 +33,8 @@ function scheduler(start = 1_000_000) {
   };
 }
 
-const bosunIdentity = (pid) => {
-  if (pid === 99) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
-  return `linux:boot-1:${pid * 10}`;
-};
+const bosunIdentities = async (pids) => new Map(pids.filter((pid) => pid !== 99).map((pid) => [pid, `linux:boot-1:${pid * 10}`]));
+const ROOTS = { startsOf: bosunIdentities, lstartsOf: async () => new Map(), pidAlive: () => true };
 
 const record = (execId, extra) => ({ execId, subphase: 'RUNNING', claim: { cpuCores: 2, header: { memoryBytes: GIB } }, ...extra });
 
@@ -49,7 +50,7 @@ async function harness(t, { bosun = true, records = () => [] } = {}) {
     puts.push(options);
     return Promise.resolve({ status: 204 });
   };
-  const shadow = openBudgetShadow({ readConfig: () => CFG, host: () => HOST, records, log: (line) => logs.push(line), now: clock.now, env, call, rootStartOf: bosunIdentity, rootAlive: () => true });
+  const shadow = openBudgetShadow({ readConfig: () => CFG, host: () => HOST, records, log: (line) => logs.push(line), now: clock.now, env, call, rootOptions: ROOTS });
   t.after(async () => { await shadow.close(); await fake.close(); });
   return { shadow, clock, fake, logs, puts };
 }
@@ -138,12 +139,67 @@ test('a refused or failed heartbeat is logged once and never throws', async (t) 
   assert.equal(shadow.shadow().source, 'standalone');
 });
 
-test('a root declares the identity bosun reads for the pid, once per lane, and skips a reused or vanished pid', () => {
+test('a root declares the identity bosun reads for the pid, once per lane, and skips a reused, unreadable or vanished pid', async () => {
   const reads = [];
-  const alive = (pid, start) => start !== 'reused';
-  const roots = rootsReader({ startOf: (pid) => { reads.push(pid); return bosunIdentity(pid); }, alive });
-  const lanes = [record('a', { pid: 41, pidStart: 'Mon Nov 24 10:00:00 2026' }), record('b', { pid: 42, pidStart: 'reused' }), record('c', { pid: 99, pidStart: 'Mon Nov 24 10:00:02 2026' })];
-  assert.deepEqual(roots(lanes).roots, [{ pid: 41, start: 'linux:boot-1:410' }]);
-  roots(lanes);
-  assert.deepEqual(reads, [41, 99, 99]);
+  const lstartsOf = async (pids) => new Map(pids.filter((pid) => pid !== 43).map((pid) => [pid, pid === 42 ? 'a later start' : 'Mon Nov 24 10:00:00 2026']));
+  const roots = rootsReader({ startsOf: async (pids) => { reads.push(...pids); return bosunIdentities(pids); }, lstartsOf, pidAlive: (pid) => pid !== 44 });
+  const lanes = [41, 42, 43, 44, 99].map((pid) => record(`l${pid}`, { pid, pidStart: 'Mon Nov 24 10:00:00 2026' }));
+  assert.deepEqual((await roots(lanes)).roots, [{ pid: 41, start: 'linux:boot-1:410' }, { pid: 43, start: 'linux:boot-1:430' }], '42 was reused, 44 is gone, 99 bosun cannot read; 43, which ps did not list though kill(0) sees it, stays');
+  await roots(lanes);
+  assert.deepEqual(reads, [41, 43, 99, 99]);
+});
+
+test('a probe that cannot complete keeps every live lane, as isProcessAlive fails closed', async () => {
+  const roots = rootsReader({ startsOf: bosunIdentities, lstartsOf: async () => undefined, pidAlive: () => true });
+  assert.deepEqual((await roots([record('a', { pid: 41, pidStart: 'x' })])).roots, [{ pid: 41, start: 'linux:boot-1:410' }]);
+});
+
+test('processStartTimes reads this process and a missing pid in one probe, matching processStartTime on every platform', async () => {
+  const missing = spawnSync('true').pid;
+  const starts = await processStartTimes([process.pid, missing]);
+  assert.equal(starts.get(process.pid), processStartTime(process.pid));
+  assert.equal(starts.has(missing), false);
+  assert.equal(await processStartTimes([process.pid], { signal: AbortSignal.abort() }), undefined, 'an aborted probe is indeterminate');
+});
+
+const ENFORCE = { ...CFG, lanePull: { ...CFG.lanePull, budgetEnforce: true } };
+const OFFERED = { freeCpu: 5, freeMem: 10 * GIB, budgetCpu: 7, freeWeight: 4, weightLimit: 4 };
+
+async function enforcementScenario(load) {
+  const { capByGrant: cap } = await load('agent/budget.js');
+  assert.deepEqual(cap(OFFERED, { source: 'bosun', ...GRANT }), { ...OFFERED, freeCpu: 3.5, freeMem: 8 * GIB, budgetCpu: 6.5 }, 'a grant below admission caps every figure');
+  const roomy = { source: 'bosun', cpu: { free: 9, ceiling: 9 }, mem: { free: 20 * GIB, ceiling: 20 * GIB } };
+  assert.deepEqual(cap(OFFERED, roomy), OFFERED, 'a grant above admission changes nothing');
+  assert.deepEqual(cap(OFFERED, { source: 'bosun', cpu: { free: -1, ceiling: 2 }, mem: { free: -GIB, ceiling: GIB } }), { ...OFFERED, freeCpu: 0, freeMem: 0, budgetCpu: 2 }, 'an overdrawn grant offers nothing, never a negative');
+  assert.deepEqual(cap(OFFERED, { source: 'standalone', ...GRANT }), OFFERED, 'a standalone budget never caps');
+  assert.equal(cap(null, { source: 'bosun', ...GRANT }), null, 'an unmeasurable claim stays unmeasurable');
+  const fullGrant = { source: 'bosun', cpu: { free: 2, ceiling: 2 }, mem: { free: 4 * GIB, ceiling: 4 * GIB } };
+  const holding = [{ subphase: 'FETCHING', claim: { cpuCores: 2, header: { memoryBytes: 4 * GIB } } }, { subphase: 'DONE', claim: { cpuCores: 2, header: { memoryBytes: 4 * GIB } } }];
+  assert.deepEqual(cap(OFFERED, fullGrant, holding), { ...OFFERED, freeCpu: 0, freeMem: 0, budgetCpu: 2 }, 'a claim made since the last heartbeat is charged against the grant at once; a DONE one is not');
+}
+
+test('an enforced bosun grant caps what a claim offers, and a standalone budget leaves it alone', () => enforcementScenario(realSrc));
+
+test('canary: a cap that trusts the heartbeat-stale free fails the enforcement test', () => assertCanaryFails('agent/budget.js',
+  ['Math.min(offered.freeCpu, budget.cpu.free, budget.cpu.ceiling - held.cpu)', 'Math.min(offered.freeCpu, budget.cpu.free)'], enforcementScenario));
+
+test('canary: a claim the grant does not cap fails the enforcement test', () => assertCanaryFails('agent/budget.js',
+  ["if (!offered || budget?.source !== 'bosun') return offered;", 'return offered;'], enforcementScenario));
+
+test('the grant is enforced only while lanePull.budgetEnforce is set, and each switch is logged once', async (t) => {
+  const { shadow, logs } = await harness(t);
+  await waitFor(() => shadow.shadow().source === 'bosun');
+  assert.equal(shadow.enforced(CFG), null, 'off by default');
+  assert.deepEqual(shadow.enforced(ENFORCE), { source: 'bosun', ...GRANT, gates: [] });
+  shadow.enforced(ENFORCE);
+  assert.equal(shadow.enforced(CFG), null);
+  assert.deepEqual(logs.filter((line) => line.startsWith('budget: claims')), ['budget: claims capped by the bosun grant', 'budget: claims no longer capped by bosun']);
+});
+
+test('an unreadable budget under enforcement is logged and leaves the claim uncapped', async (t) => {
+  const logs = [];
+  const shadow = openBudgetShadow({ readConfig: () => CFG, host: () => { throw new Error('no host'); }, records: () => [], log: (line) => logs.push(line), env: {}, rootOptions: ROOTS });
+  t.after(() => shadow.close());
+  assert.equal(shadow.enforced(ENFORCE), null);
+  assert.ok(logs.includes('budget: budget unreadable: no host'), logs.join('\n'));
 });
