@@ -3403,6 +3403,10 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   `os.availableParallelism()` and the cgroup's `cpu.max`/`cpuset` (BRAIN-860); a caller's explicit
   `parallelism` (a sampler's fixture CPU list) still wins. `npm test` sets it to
   the machine's core count, so the suite behaves the same inside a 1-core runner lane as on a bare host.
+- `LANE_BROKER_TEST_HOST_MEMORY` — `<totalBytes>,<availableBytes>`: the memory `detectResourceCapacity()`
+  reports instead of `os`, `vm_stat` and the cgroup's `memory.max` (PKG-471; source tag `test-memory`); a
+  malformed value is ignored. `npm test` sets it to 64 GiB total / 48 GiB available, so admission
+  tests do not depend on how much memory the runner has free.
 - `LANE_BROKER_TEST_MEMORY_PRESSURE` — `vmPressureLevel,psiSomeAvg10,swapBytes` (a blank field is unknown; `swapBytes` is the since-boot counter) replaces
   the memory gate's reading (PKG-404). `npm test` sets it to `,,`, so a busy test host's real paging never closes the gate mid-suite.
 - `LANE_BROKER_BOOT_ID` — override the detected boot id, to simulate a reboot.

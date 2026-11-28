@@ -83,6 +83,14 @@ function cgroupV2Dirs(readFile) {
   return [...new Set(dirs)];
 }
 
+/** `<totalBytes>,<availableBytes>` or null: anything else is no override. */
+export function parseTestHostMemory(raw) {
+  const match = /^(\d+),(\d+)$/.exec(String(raw ?? ''));
+  if (!match) return null;
+  const [totalBytes, availableBytes] = [Number(match[1]), Number(match[2])];
+  return totalBytes > 0 && Number.isSafeInteger(totalBytes) && Number.isSafeInteger(availableBytes) ? { totalBytes, availableBytes } : null;
+}
+
 /** Resources available to this execution environment. WSL is intentionally
  * treated as Linux: cgroup limits win over host-level values when present. */
 export function detectResourceCapacity({
@@ -94,14 +102,15 @@ export function detectResourceCapacity({
   vmStatText = null,
   exec = execFileSync,
   testHostCores = Number(process.env.LANE_BROKER_TEST_HOST_CORES) || null,
+  testHostMemory = parseTestHostMemory(process.env.LANE_BROKER_TEST_HOST_MEMORY),
 } = {}) {
   const machineCores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
   let cpuCores = Math.max(1, Number(parallelism ?? testHostCores ?? machineCores) || 1);
-  let memoryBytes = Math.max(1, Number(totalMemory) || 1);
-  let availableMemoryBytes = Math.max(0, Number(freeMemory) || 0);
-  const sources = ['os'];
+  let memoryBytes = Math.max(1, Number(testHostMemory?.totalBytes ?? totalMemory) || 1);
+  let availableMemoryBytes = Math.max(0, Number(testHostMemory?.availableBytes ?? freeMemory) || 0);
+  const sources = [testHostMemory ? 'test-memory' : 'os'];
 
-  if (platform === 'darwin') {
+  if (platform === 'darwin' && !testHostMemory) {
     // os.freemem() on macOS counts only free pages, excluding
     // inactive/speculative pages that are just as reclaimable (BRAIN-252) —
     // it reads ~1.8GB "free" on a box that's actually ~80% idle. vm_stat's
@@ -157,7 +166,7 @@ export function detectResourceCapacity({
       const memoryMax = finiteCgroupBytes(readText(`${dir}/memory.max`, readFile));
       // BRAIN-385: reclaimable page cache is available, not used (the kubelet's working set is current - inactive_file)
       const memoryCurrent = (finiteCgroupBytes(readText(`${dir}/memory.current`, readFile)) ?? 0) - cgroupInactiveFileBytes(dir, readFile);
-      if (memoryMax !== null) {
+      if (memoryMax !== null && !testHostMemory) {
         memoryBytes = Math.min(memoryBytes, memoryMax);
         availableMemoryBytes = Math.min(availableMemoryBytes, Math.max(0, memoryMax - Math.max(0, memoryCurrent)));
         foundMemory = true;

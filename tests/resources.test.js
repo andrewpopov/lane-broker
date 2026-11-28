@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readMemoryInfo } from '../src/cpu.js';
 import {
   detectResourceCapacity,
+  parseTestHostMemory,
   evaluateMemoryAdmission,
   parseByteSize,
   parseCpuMax,
@@ -10,6 +12,7 @@ import {
 } from '../src/resources.js';
 
 delete process.env.LANE_BROKER_TEST_HOST_CORES;
+delete process.env.LANE_BROKER_TEST_HOST_MEMORY;
 
 test('resource parsers accept human sizes, fractional quotas, and CPU sets', () => {
   assert.equal(parseByteSize('1.5GiB'), 1.5 * 1024 ** 3);
@@ -225,4 +228,35 @@ test('BRAIN-385: cgroup inactive_file page cache counts as available, not used',
     readFile: (file) => { if (files.has(file)) return files.get(file); throw new Error('ENOENT'); },
   });
   assert.equal(Math.round((snapshot.availableMemoryBytes / GiB) * 10) / 10, 8.9); // 10 - (2.7 - 1.6)
+});
+
+test('LANE_BROKER_TEST_HOST_MEMORY replaces total and available memory from os, vm_stat and cgroups, and leaves cores alone', () => {
+  const GiB = 1024 ** 3;
+  const hostMemory = parseTestHostMemory(`${64 * GiB},${48 * GiB}`);
+  const cgroup = (file) => ({ '/sys/fs/cgroup/memory.max': String(2 * GiB), '/sys/fs/cgroup/memory.current': String(GiB) })[file] ?? (() => { throw new Error('missing'); })();
+  const linux = detectResourceCapacity({ platform: 'linux', parallelism: 5, totalMemory: 8 * GiB, freeMemory: GiB, readFile: cgroup, testHostMemory: hostMemory });
+  assert.deepEqual([linux.cpuCores, linux.memoryBytes, linux.availableMemoryBytes, linux.source], [5, 64 * GiB, 48 * GiB, 'test-memory']);
+  const darwin = detectResourceCapacity({ platform: 'darwin', parallelism: 5, totalMemory: 8 * GiB, freeMemory: GiB, vmStatText: 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 10.\n', testHostMemory: hostMemory });
+  assert.deepEqual([darwin.memoryBytes, darwin.availableMemoryBytes, darwin.source], [64 * GiB, 48 * GiB, 'test-memory']);
+});
+
+test('a malformed LANE_BROKER_TEST_HOST_MEMORY is no override', () => {
+  for (const raw of ['', '1', '1,', ',1', '0,5', '-1,5', '1.5,2', '1,2,3', 'a,b', ' 1,2', undefined]) {
+    assert.equal(parseTestHostMemory(raw), null, JSON.stringify(raw));
+  }
+  assert.deepEqual(parseTestHostMemory('100,40'), { totalBytes: 100, availableBytes: 40 });
+  const real = detectResourceCapacity({ platform: 'linux', totalMemory: 1000, freeMemory: 400, readFile: () => { throw new Error('missing'); }, testHostMemory: parseTestHostMemory('junk') });
+  assert.deepEqual([real.memoryBytes, real.availableMemoryBytes, real.source], [1000, 400, 'os']);
+});
+
+test('the env hook reaches readMemoryInfo, the default memoryReader of tryStart', () => {
+  process.env.LANE_BROKER_TEST_HOST_MEMORY = '1000,250';
+  try {
+    const info = readMemoryInfo(() => '1');
+    // A runner inside a CPU-limited cgroup also reports cgroup-cpu/cpuset; only the memory sources are pinned.
+    const memorySources = info.source.split('+').filter((s) => s.includes('memory'));
+    assert.deepEqual([info.totalBytes, info.availableBytes, memorySources], [1000, 250, ['test-memory']]);
+  } finally {
+    delete process.env.LANE_BROKER_TEST_HOST_MEMORY;
+  }
 });

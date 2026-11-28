@@ -4,6 +4,9 @@ import { INHERITED_BROKER_VARS } from '../helpers.js';
 // BRAIN-860: the suite runs inside a 1-core runner lane; capacity must be the machine's, as on a bare host.
 process.env.LANE_BROKER_TEST_HOST_CORES ??= String(os.cpus().length);
 
+// PKG-471: a default 2 GiB ticket must not be denied for the runner's real (swapping) memory.
+process.env.LANE_BROKER_TEST_HOST_MEMORY ??= `${64 * 1024 ** 3},${48 * 1024 ** 3}`;
+
 // PKG-404: the memory gate reads this host's paging; the suite's own load must never close it mid-run.
 process.env.LANE_BROKER_TEST_MEMORY_PRESSURE ??= ',,';
 
