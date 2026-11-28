@@ -3574,7 +3574,7 @@ The 8×200 mutex hammer is in `tests/heavy/`.
 The scale, perf and soak tests live in `tests/heavy/` and run with `npm run test:heavy`, not
 `npm test`: claim latency at 60,000 queued jobs, the Postgres lock-order soak and the 8×200 mutex
 hammer. They measure the host as much as the code, so PR CI leaves them out, and the merge train's
-master verify runs them on every master tip (`.train.json` `masterCommand`, `scripts/train-gate.sh
+master verify runs them on every master tip (`.train.json` top-level `command`, `scripts/train-gate.sh
 heavy`). A red there opens the train's master-red incident, as any master verify does.
 
 PR CI splits `npm test` across 4 lanes (`.train.json` `prCi.shards: 4`, one PR at a time), and so do the train's batches and master verify (`shards: 4`; the `train` lane allows 4 at once). Run whole, the suite is about 100 minutes of serial test time, too long to ride on one lane (PKG-405). The master verify's `heavy` tier gives each shard its share of `tests/heavy` (`node scripts/test-files.js tests/heavy`), and a shard with none passes at once. The suite waits far more than it computes (one full run used 1,793 CPU-seconds in 2,428 s of wall time), so each `pr` lane claims a fixed 2 cores (`minCpuCores` 2 and `rightSize: false`, PKG-472: an equal floor is dropped from the request, so history right-sizing would otherwise still shrink it to 1; a 1-core grant ran each shard's files serially, which stretched the wall-clock-sensitive tests past their windows). When the merge train sets `TRAIN_SHARD=i/N`, `scripts/train-gate.sh`
